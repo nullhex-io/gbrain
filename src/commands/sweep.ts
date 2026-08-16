@@ -27,8 +27,8 @@ Usage:
 Runs the three bounded sweep passes against the connected brain:
   1. facts-fence reconciliation (zero-LLM): recently-modified pages with a
      "## Facts" fence get their facts DB index reconciled.
-  2. link/timeline extraction (zero-LLM): the same deterministic extraction
-     "gbrain extract" runs, over recently-modified pages.
+  2. link/timeline reconciliation (zero-LLM): the same deterministic extraction
+     "gbrain extract" runs over stale pages and removes obsolete managed links.
   3. corpus ingest (spend-gated): unprocessed transcript .txt files run
      through facts extraction. Skipped in keyless mode (no provider key).
 
@@ -109,6 +109,7 @@ export async function runSweep(engine: BrainEngine, args: string[]): Promise<voi
     console.log(`Sweep complete (${report.durationMs}ms, source=${sourceId}):`);
     console.log(`  facts reconciled:   ${report.factsReconciled}`);
     console.log(`  links extracted:    ${report.linksExtracted}`);
+    console.log(`  links removed:      ${report.linksRemoved}`);
     console.log(`  timeline extracted: ${report.timelineExtracted}`);
     console.log(`  corpus ingested:    ${report.corpusIngested}`);
     if (report.skipped.length > 0) {

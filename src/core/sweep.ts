@@ -19,9 +19,8 @@
  *   2. LINK/TIMELINE EXTRACTION [CX-P0.3] — zero-LLM, deterministic. The
  *      same per-page cores `gbrain extract links|timeline --source db`
  *      runs: extractPageLinks + parseTimelineEntries, endpoint-validated
- *      through resolveCandidateSources and batch-written via
- *      addLinksBatch / addTimelineEntriesBatch, then watermark-stamped
- *      (stampExtracted) since both kinds ran.
+ *      through resolveCandidateSources, reconciled against managed links,
+ *      and written alongside addTimelineEntriesBatch before watermarking.
  *
  *   3. CORPUS INGEST [CX-P0.1] — LLM-backed, spend-gated. Unprocessed
  *      `.txt` files in the dream corpus dir run through the narrowest
@@ -48,6 +47,8 @@ import { readdir, readFile, writeFile, rm, stat } from 'node:fs/promises';
 import type { BrainEngine, LinkBatchInput, TimelineBatchInput } from './engine.ts';
 import type { FactsBackstopCtx } from './facts/backstop.ts';
 import { detectCapabilities, type CapabilityReport } from './capability.ts';
+import { buildLinkRows } from './batch-rows.ts';
+import { executeRawJsonb } from './sql-query.ts';
 
 /** Delay before the serve-startup sweep fires (post-connect settle). */
 export const STARTUP_SWEEP_DELAY_MS = 3_000;
@@ -62,6 +63,9 @@ const FACTS_FENCE_BEGIN_MARKER = 'gbrain:facts:begin';
  * bulk-sync day can't turn pass 1 into a whole-table scan.
  */
 export const FENCE_LIKE_SCAN_CAP = 500;
+
+/** Prefix for the durable, source-qualified pass-2 continuation cursor. */
+const LINKS_TIMELINE_CURSOR_KEY_PREFIX = 'sweep.links_timeline.cursor.v1.';
 
 /** Sidecar suffix marking a corpus file as processed. */
 export const CORPUS_INGESTED_SUFFIX = '.ingested';
@@ -105,6 +109,7 @@ export interface SweepReport {
   corpusIngested: number;
   factsReconciled: number;
   linksExtracted: number;
+  linksRemoved: number;
   timelineExtracted: number;
   skipped: SweepSkip[];
   durationMs: number;
@@ -130,6 +135,7 @@ export async function runMaintenanceSweep(
     corpusIngested: 0,
     factsReconciled: 0,
     linksExtracted: 0,
+    linksRemoved: 0,
     timelineExtracted: 0,
     skipped: [],
     durationMs: 0,
@@ -208,6 +214,7 @@ export async function runMaintenanceSweep(
           overBudget,
           report,
           skip,
+          log,
         });
       }
     } catch (e) {
@@ -254,6 +261,105 @@ interface PassCtx {
   overBudget: () => boolean;
   report: SweepReport;
   skip: (reason: string, count?: number) => void;
+  log: (msg: string) => void;
+}
+
+interface LinksTimelineCursor {
+  updatedAt: string;
+  id: number;
+}
+
+function linksTimelineCursorKey(sourceId: string): string {
+  // Config is brain-global, while the sweep is source-scoped. Encoding keeps
+  // arbitrary source ids from changing the key structure.
+  return LINKS_TIMELINE_CURSOR_KEY_PREFIX + encodeURIComponent(sourceId);
+}
+
+function parseLinksTimelineCursor(value: string | null): LinksTimelineCursor | null {
+  if (!value) return null;
+  try {
+    const parsed: unknown = JSON.parse(value);
+    if (
+      typeof parsed !== 'object' || parsed === null ||
+      !('updatedAt' in parsed) || !('id' in parsed)
+    ) return null;
+    const { updatedAt, id } = parsed as { updatedAt?: unknown; id?: unknown };
+    if (
+      typeof updatedAt !== 'string' || !Number.isFinite(Date.parse(updatedAt)) ||
+      typeof id !== 'number' || !Number.isInteger(id) || id < 1
+    ) return null;
+    return { updatedAt, id };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Select at most one bounded batch, continuing after the prior page cursor.
+ * The first seek walks older rows in the normal newest-first order. If it
+ * reaches the end, the one allowed wrap query starts at the cursor itself so
+ * an unstamped failed page is retried before newer rows can monopolise it.
+ */
+async function selectLinksTimelineCandidates(
+  engine: BrainEngine,
+  sourceId: string,
+  cutoffIso: string,
+  batchLimit: number,
+  cursor: LinksTimelineCursor | null,
+): Promise<Array<{ id: number; slug: string; updated_at_iso: string }>> {
+  if (!cursor) {
+    return engine.executeRaw<{ id: number; slug: string; updated_at_iso: string }>(
+      `SELECT id, slug,
+              to_char(updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS updated_at_iso
+         FROM pages
+        WHERE source_id = $1
+          AND deleted_at IS NULL
+          AND updated_at >= $2::timestamptz
+          AND (links_extracted_at IS NULL OR updated_at > links_extracted_at)
+        ORDER BY updated_at DESC, id DESC
+        LIMIT $3`,
+      [sourceId, cutoffIso, batchLimit],
+    );
+  }
+  const select = async (
+    predicate: string,
+    order: 'ASC' | 'DESC',
+    limit: number,
+  ): Promise<Array<{ id: number; slug: string; updated_at_iso: string }>> =>
+    engine.executeRaw<{ id: number; slug: string; updated_at_iso: string }>(
+      `SELECT id, slug,
+              to_char(updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS updated_at_iso
+         FROM pages
+        WHERE source_id = $1
+          AND deleted_at IS NULL
+          AND updated_at >= $2::timestamptz
+          AND (links_extracted_at IS NULL OR updated_at > links_extracted_at)
+          AND ${predicate}
+        ORDER BY updated_at ${order}, id ${order}
+        LIMIT $5`,
+      [sourceId, cutoffIso, cursor.updatedAt, cursor.id, limit],
+    );
+
+  const older = await select(
+    '(updated_at < $3::timestamptz OR (updated_at = $3::timestamptz AND id < $4::integer))',
+    'DESC',
+    batchLimit,
+  );
+  if (older.length === batchLimit) return older;
+
+  // The bounded wrap includes an unstamped cursor row, which makes failed
+  // pages retryable without letting a newest persistent failure pin every
+  // later sweep.
+  const wrapped = await select(
+    '(updated_at > $3::timestamptz OR (updated_at = $3::timestamptz AND id >= $4::integer))',
+    'DESC',
+    batchLimit - older.length,
+  );
+  // A concurrent edit can move an older-arm row across the cursor between
+  // the two reads. Keep this pass bounded and idempotent by attempting each
+  // page at most once; a short batch simply resumes on the next sweep.
+  const seen = new Set(older.map(row => row.id));
+  return [...older, ...wrapped.filter(row => !seen.has(row.id))];
 }
 
 /**
@@ -261,14 +367,14 @@ interface PassCtx {
  * links|timeline --source db` (extract.ts:extractLinksFromDB /
  * extractTimelineFromDB): extractPageLinks + parseTimelineEntries, with
  * resolveCandidateSources doing the multi-source endpoint validation and
- * stampExtracted advancing the links_extracted_at watermark (both kinds
- * run here, so stamping is correct per extract.ts's C3/D6 rule).
+ * the selected revision advancing links_extracted_at only after both kinds
+ * complete (the shared watermark contract from extract.ts C3/D6).
  */
 async function runLinksTimelinePass(
   engine: BrainEngine,
   ctx: PassCtx & { cutoffIso: string },
 ): Promise<void> {
-  const { sourceId, batchLimit, cutoffIso, overBudget, report, skip } = ctx;
+  const { sourceId, batchLimit, cutoffIso, overBudget, report, skip, log } = ctx;
 
   const {
     extractPageLinks,
@@ -288,21 +394,26 @@ async function runLinksTimelinePass(
   if (!timelineEnabled) skip('auto_timeline_disabled');
   if (!linksEnabled && !timelineEnabled) return;
 
-  const recent = await engine.executeRaw<{ slug: string }>(
-    `SELECT slug FROM pages
-      WHERE source_id = $1
-        AND deleted_at IS NULL
-        AND updated_at >= $2::timestamptz
-      ORDER BY updated_at DESC
-      LIMIT $3`,
-    [sourceId, cutoffIso, batchLimit],
+  const cursorKey = linksTimelineCursorKey(sourceId);
+  let cursor: LinksTimelineCursor | null = null;
+  try {
+    cursor = parseLinksTimelineCursor(await engine.getConfig(cursorKey));
+  } catch (e) {
+    skip('links_timeline_cursor_read_error');
+    log(
+      `[sweep] failed to read links/timeline cursor for ${sourceId}: ` +
+      (e instanceof Error ? e.message : String(e)),
+    );
+  }
+  const recent = await selectLinksTimelineCandidates(
+    engine, sourceId, cutoffIso, batchLimit, cursor,
   );
   if (recent.length === 0) return;
 
-  // resolveCandidateSources + stampExtracted are the shared helpers the
-  // extract command exports precisely so sibling walkers can't drift from
-  // its F10 multi-source resolution (see extract.ts:114).
-  const { resolveCandidateSources, stampExtracted } = await import('../commands/extract.ts');
+  // resolveCandidateSources is the shared helper the extract command exports
+  // precisely so sibling walkers cannot drift from its F10 multi-source
+  // resolution (see extract.ts:114).
+  const { resolveCandidateSources } = await import('../commands/extract.ts');
 
   const resolver = makeResolver(engine, { mode: 'batch', sourceId });
   const globalBasename = await isGlobalBasenameEnabled(engine);
@@ -310,8 +421,10 @@ async function runLinksTimelinePass(
   type Extracted = Awaited<ReturnType<typeof extractPageLinks>>;
 
   const tlBatch: TimelineBatchInput[] = [];
-  const processedRefs: Array<{ slug: string; source_id: string }> = [];
+  const processedRefs: Array<{ slug: string; source_id: string; extractedAt: string }> = [];
   const pageCandidates: Array<{ slug: string; candidates: Extracted['candidates'] }> = [];
+  let extractionBudgetStopped = false;
+  let lastAttempted: LinksTimelineCursor | null = null;
 
   // Phase 1: per-page extraction. The per-slug getPage loop stays a loop —
   // BrainEngine has no batch read-by-slug-list primitive (resolveSlugsByPaths
@@ -319,41 +432,82 @@ async function runLinksTimelinePass(
   for (let i = 0; i < recent.length; i++) {
     if (overBudget()) {
       skip('budget_exhausted:links_timeline', recent.length - i);
+      extractionBudgetStopped = true;
       break;
     }
     const slug = recent[i].slug;
-    const page = await engine.getPage(slug, { sourceId });
-    if (!page) continue;
+    // Advance the round-robin cursor only after a real attempt. This keeps a
+    // failed page unstamped and retryable, while its older neighbours get a
+    // bounded turn on the next sweep instead of being pinned behind it.
+    lastAttempted = { updatedAt: recent[i].updated_at_iso, id: recent[i].id };
+    try {
+      const page = await engine.getPage(slug, { sourceId });
+      if (!page) continue;
 
-    const fullContent = page.compiled_truth + '\n' + page.timeline;
+      const fullContent = page.compiled_truth + '\n' + page.timeline;
+      const pageCandidatesForSlug: Extracted['candidates'] = [];
+      const pageTimelineRows: TimelineBatchInput[] = [];
 
-    if (linksEnabled) {
-      // skipFrontmatter matches user-invoked `gbrain extract links`
-      // (frontmatter backfill stays a migration-orchestrator concern).
-      const extracted = await extractPageLinks(
-        slug, fullContent, page.frontmatter, page.type, resolver,
-        { skipFrontmatter: true, globalBasename },
+      if (linksEnabled) {
+        // skipFrontmatter matches user-invoked `gbrain extract links`
+        // (frontmatter backfill stays a migration-orchestrator concern).
+        const extracted = await extractPageLinks(
+          slug, fullContent, page.frontmatter, page.type, resolver,
+          { skipFrontmatter: true, globalBasename },
+        );
+        pageCandidatesForSlug.push(...extracted.candidates);
+      }
+
+      if (timelineEnabled) {
+        for (const entry of parseTimelineEntries(fullContent)) {
+          // Same row shape as extractTimelineFromDB's batch push (extract.ts):
+          // no explicit source (engine default applies), detail '' when empty.
+          pageTimelineRows.push({
+            slug,
+            date: entry.date,
+            summary: entry.summary,
+            detail: entry.detail || '',
+            source_id: sourceId,
+          });
+        }
+      }
+
+      if (pageCandidatesForSlug.length > 0) {
+        pageCandidates.push({ slug, candidates: pageCandidatesForSlug });
+      }
+      tlBatch.push(...pageTimelineRows);
+      processedRefs.push({
+        slug,
+        source_id: sourceId,
+        // Stamp the exact full-microsecond value selected for this page. If a
+        // concurrent write advances updated_at after the SELECT, the older stamp
+        // leaves the page stale so a later sweep reconciles the newer content.
+        extractedAt: recent[i].updated_at_iso,
+      });
+    } catch (e) {
+      skip('page_extraction_error');
+      log(
+        `[sweep] page extraction failed for ${sourceId}:${slug}: ` +
+        (e instanceof Error ? e.message : String(e)),
       );
-      if (extracted.candidates.length > 0) {
-        pageCandidates.push({ slug, candidates: extracted.candidates });
-      }
     }
-
-    if (timelineEnabled) {
-      for (const entry of parseTimelineEntries(fullContent)) {
-        // Same row shape as extractTimelineFromDB's batch push (extract.ts):
-        // no explicit source (engine default applies), detail '' when empty.
-        tlBatch.push({
-          slug,
-          date: entry.date,
-          summary: entry.summary,
-          detail: entry.detail || '',
-          source_id: sourceId,
-        });
-      }
+  }
+  if (lastAttempted) {
+    try {
+      await engine.setConfig(cursorKey, JSON.stringify(lastAttempted));
+    } catch (e) {
+      skip('links_timeline_cursor_write_error');
+      log(
+        `[sweep] failed to write links/timeline cursor for ${sourceId}: ` +
+        (e instanceof Error ? e.message : String(e)),
+      );
     }
-
-    processedRefs.push({ slug, source_id: sourceId });
+  }
+  if (overBudget()) {
+    if (!extractionBudgetStopped) {
+      skip('budget_exhausted:links_timeline', processedRefs.length || 1);
+    }
+    return;
   }
 
   // Phase 2: endpoint validation is scoped to the slugs the candidates
@@ -363,7 +517,8 @@ async function runLinksTimelinePass(
   // lookup keeps listAllPageRefs' visibility semantics (deleted_at IS NULL),
   // so resolveCandidateSources' F10 resolution is unchanged — it just sees
   // only the rows it can possibly use. Zero candidates ⇒ zero queries.
-  const linkBatch: LinkBatchInput[] = [];
+  const desiredLinks = new Map<string, LinkBatchInput[]>();
+  for (const ref of processedRefs) desiredLinks.set(ref.slug, []);
   if (pageCandidates.length > 0) {
     const needed = new Set<string>();
     for (const { slug, candidates } of pageCandidates) {
@@ -378,7 +533,12 @@ async function runLinksTimelinePass(
       for (const c of candidates) {
         const resolved = resolveCandidateSources(c, slug, sourceId, allSlugs, slugToSources);
         if (!resolved) continue;
-        linkBatch.push({
+        if (resolved.fromSlug !== slug || resolved.fromSourceId !== sourceId) {
+          throw new Error(
+            `sweep extraction emitted a non-outgoing edge for ${sourceId}:${slug}`,
+          );
+        }
+        desiredLinks.get(slug)!.push({
           from_slug: resolved.fromSlug,
           to_slug: c.targetSlug,
           link_type: c.linkType,
@@ -394,19 +554,157 @@ async function runLinksTimelinePass(
     }
   }
 
-  // Engine batch primitives self-retry; default auditSite labels apply
-  // (BATCH_AUDIT_SITES is a closed enum owned by retry.ts).
-  if (linkBatch.length > 0) {
-    report.linksExtracted += await engine.addLinksBatch(linkBatch); // gbrain-allow-direct-insert: the sweep IS the extract path for workspace pages — remote put_page skips extraction by design [CX-P0.3]
+  const reconciledRefs: typeof processedRefs = [];
+  let reconciliationBudgetStopped = false;
+  if (linksEnabled) {
+    for (let i = 0; i < processedRefs.length; i++) {
+      if (overBudget()) {
+        skip('budget_exhausted:links_timeline', processedRefs.length - i);
+        reconciliationBudgetStopped = true;
+        break;
+      }
+      const ref = processedRefs[i];
+      try {
+        const reconciled = await reconcileSweepLinks(
+          engine,
+          ref.slug,
+          sourceId,
+          desiredLinks.get(ref.slug) ?? [],
+        );
+        report.linksExtracted += reconciled.created;
+        report.linksRemoved += reconciled.removed;
+        reconciledRefs.push(ref);
+      } catch (e) {
+        skip('link_reconcile_error');
+        log(
+          `[sweep] link reconciliation failed for ${sourceId}:${ref.slug}: ` +
+          (e instanceof Error ? e.message : String(e)),
+        );
+      }
+    }
   }
+  if (overBudget()) {
+    if (!reconciliationBudgetStopped) {
+      skip('budget_exhausted:links_timeline', processedRefs.length || 1);
+    }
+    return;
+  }
+  // Timeline batch primitive self-retries; the default auditSite label applies
+  // (BATCH_AUDIT_SITES is a closed enum owned by retry.ts).
   if (tlBatch.length > 0) {
     report.timelineExtracted += await engine.addTimelineEntriesBatch(tlBatch); // gbrain-allow-direct-insert: same extract-path rationale as addLinksBatch above [CX-P0.3]
   }
   // Stamp only when BOTH kinds ran for these pages (extract.ts C3/D6:
   // links_extracted_at covers links AND timeline).
-  if (linksEnabled && timelineEnabled && processedRefs.length > 0) {
-    await stampExtracted(engine, processedRefs);
+  if (linksEnabled && timelineEnabled && reconciledRefs.length > 0) {
+    // Unlike inline extraction, this watermark is the sweep's resume cursor.
+    // Fail loudly to the pass-level catch so an unstamped page retries instead
+    // of swallowing a stamp failure and re-chewing an invisible partial batch.
+    await engine.markPagesExtractedBatch(reconciledRefs, new Date().toISOString());
   }
+}
+
+/**
+ * Reconcile the sweep-owned outgoing links for one source-qualified page.
+ * Manual, frontmatter, custom-provenance, and legacy NULL-provenance rows are
+ * outside this sweep's ownership and are never removed.
+ */
+async function reconcileSweepLinks(
+  engine: BrainEngine,
+  slug: string,
+  sourceId: string,
+  desired: LinkBatchInput[],
+): Promise<{ created: number; removed: number }> {
+  return engine.transaction(async (tx) => {
+    // Match runAutoLink's existing lock key so a local put_page and the serve
+    // sweep cannot reconcile the same slug concurrently.
+    await tx.executeRaw(
+      `SELECT pg_advisory_xact_lock(hashtext($1)::bigint)`,
+      [`auto_link:${slug}`],
+    );
+
+    // This trusted maintenance transaction performs its own exact source
+    // predicate below. Bind the RLS defense-in-depth scope to the trusted
+    // wildcard so a legitimate cross-source target remains visible. Avoid
+    // tx.getLinks(): with RLS binding enabled it opens its own transaction,
+    // but postgres.js transaction handles expose savepoint(), not begin().
+    await tx.executeRaw(`SELECT set_config('app.scopes', '*', true)`);
+
+    // addLinksBatch owns connection-level retry and must not run inside an
+    // outer transaction. Use its shared row builder and one transaction-local
+    // statement so the advisory lock, inserts, stale reads, and deletes remain
+    // one atomic unit even when the connection fails.
+    const created = desired.length > 0
+      ? (await executeRawJsonb<{ inserted: number }>(
+          tx,
+          `INSERT INTO links (
+             from_page_id, to_page_id, link_type, context, link_source,
+             link_kind, origin_page_id, origin_field
+           )
+           SELECT f.id, t.id, v.link_type, v.context, v.link_source,
+                  v.link_kind, o.id, v.origin_field
+             FROM jsonb_to_recordset(($1::jsonb)->'rows') AS v(
+               from_slug text, to_slug text, link_type text, context text,
+               link_source text, origin_slug text, origin_field text,
+               from_source_id text, to_source_id text,
+               origin_source_id text, link_kind text
+             )
+             JOIN pages f
+               ON f.slug = v.from_slug AND f.source_id = v.from_source_id
+             JOIN pages t
+               ON t.slug = v.to_slug AND t.source_id = v.to_source_id
+             LEFT JOIN pages o
+               ON o.slug = v.origin_slug AND o.source_id = v.origin_source_id
+           ON CONFLICT (
+             from_page_id, to_page_id, link_type, link_source, origin_page_id
+           ) DO NOTHING
+           RETURNING 1 AS inserted`,
+          [],
+          [{ rows: buildLinkRows(desired) }],
+        )).length
+      : 0;
+
+    const managed = await tx.executeRaw<{
+      id: number;
+      to_slug: string;
+      to_source_id: string;
+      link_type: string;
+      link_source: string;
+    }>(
+      `SELECT l.id, t.slug AS to_slug, t.source_id AS to_source_id,
+              l.link_type, l.link_source
+         FROM links l
+         JOIN pages f ON f.id = l.from_page_id
+         JOIN pages t ON t.id = l.to_page_id
+        WHERE f.slug = $1
+          AND f.source_id = $2
+          AND l.link_source IN ('markdown', 'wikilink-resolved')
+          AND l.origin_page_id IS NULL
+          AND t.deleted_at IS NULL`,
+      [slug, sourceId],
+    );
+    const keyForDesired = (link: LinkBatchInput): string =>
+      `${link.to_source_id || 'default'}\u0000${link.to_slug}\u0000${link.link_type || ''}\u0000${link.link_source || 'markdown'}`;
+    const keyForExisting = (link: (typeof managed)[number]): string =>
+      `${link.to_source_id}\u0000${link.to_slug}\u0000${link.link_type}\u0000${link.link_source}`;
+    const desiredKeys = new Set(desired.map(keyForDesired));
+    const staleIds = managed
+      .filter(link => !desiredKeys.has(keyForExisting(link)))
+      .map(link => link.id);
+    const removed = staleIds.length > 0
+      ? (await tx.executeRaw<{ id: number }>(
+          `DELETE FROM links l
+            USING pages t
+           WHERE l.id = ANY($1::int[])
+             AND t.id = l.to_page_id
+             AND t.deleted_at IS NULL
+           RETURNING l.id AS id`,
+          [staleIds],
+        )).length
+      : 0;
+
+    return { created, removed };
+  });
 }
 
 /**
