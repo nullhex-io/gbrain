@@ -31,13 +31,16 @@ const get_active_schema_pack: Operation = {
   params: {},
   scope: 'read',
   handler: async (ctx) => {
-    const { loadActivePack, resolveActivePackNameOnly } = await import('../schema-pack/load-active.ts');
+    const { resolveActivePackNameOnly } = await import('../schema-pack/load-active.ts');
+    const { loadActivePackForOp } = await import('../schema-pack/op-trust-gate.ts');
     const { loadConfig } = await import('../config.ts');
     const cfg = loadConfig();
     const sourceOpts: Record<string, unknown> = {};
-    if (ctx.sourceId) sourceOpts.sourceId = ctx.sourceId;
+    const scope = sourceScopeOpts(ctx);
+    if (scope.sourceIds?.length) sourceOpts.sourceId = scope.sourceIds[0];
+    else if (scope.sourceId) sourceOpts.sourceId = scope.sourceId;
     const resolution = resolveActivePackNameOnly({ cfg, remote: ctx.remote ?? true, ...sourceOpts });
-    const pack = await loadActivePack({ cfg, remote: ctx.remote ?? true, ...sourceOpts });
+    const pack = await loadActivePackForOp(ctx, {});
     const primitiveSummary: Record<string, number> = {};
     for (const t of pack.manifest.page_types) {
       primitiveSummary[t.primitive] = (primitiveSummary[t.primitive] ?? 0) + 1;
@@ -104,11 +107,10 @@ const schema_lint: Operation = {
   scope: 'read',
   handler: async (ctx, p) => {
     const { runAllLintRules } = await import('../schema-pack/lint-rules.ts');
-    const { loadActivePack } = await import('../schema-pack/load-active.ts');
-    const { loadConfig, gbrainPath } = await import('../config.ts');
+    const { loadActivePackForOp } = await import('../schema-pack/op-trust-gate.ts');
+    const { gbrainPath } = await import('../config.ts');
     const { existsSync } = await import('node:fs');
     const { join } = await import('node:path');
-    const cfg = loadConfig();
     let manifest;
     if (p.pack) {
       // Locate by name without trust-gating per-call schema_pack opt
@@ -124,7 +126,7 @@ const schema_lint: Operation = {
       const { loadPackFromFile: loader } = await import('../schema-pack/loader.ts');
       manifest = loader(path);
     } else {
-      const resolved = await loadActivePack({ cfg, remote: ctx.remote ?? true, sourceId: ctx.sourceId });
+      const resolved = await loadActivePackForOp(ctx, {});
       manifest = resolved.manifest;
     }
     // File-plane only over MCP; the engine-aware --with-db opt-in is
@@ -139,10 +141,8 @@ const schema_graph: Operation = {
   params: {},
   scope: 'read',
   handler: async (ctx) => {
-    const { loadActivePack } = await import('../schema-pack/load-active.ts');
-    const { loadConfig } = await import('../config.ts');
-    const cfg = loadConfig();
-    const pack = await loadActivePack({ cfg, remote: ctx.remote ?? true, sourceId: ctx.sourceId });
+    const { loadActivePackForOp } = await import('../schema-pack/op-trust-gate.ts');
+    const pack = await loadActivePackForOp(ctx, {});
     const nodes = pack.manifest.page_types.map((t) => ({ name: t.name, primitive: t.primitive }));
     const edges: Array<{ from: string; verb: string; to: string }> = [];
     for (const lt of pack.manifest.link_types) {
@@ -169,10 +169,8 @@ const schema_explain_type: Operation = {
   },
   scope: 'read',
   handler: async (ctx, p) => {
-    const { loadActivePack } = await import('../schema-pack/load-active.ts');
-    const { loadConfig } = await import('../config.ts');
-    const cfg = loadConfig();
-    const pack = await loadActivePack({ cfg, remote: ctx.remote ?? true, sourceId: ctx.sourceId });
+    const { loadActivePackForOp } = await import('../schema-pack/op-trust-gate.ts');
+    const pack = await loadActivePackForOp(ctx, {});
     const found = pack.manifest.page_types.find((t) => t.name === p.type);
     if (!found) return { error: 'type_not_found', type: p.type as string, pack: pack.manifest.name };
     return { schema_version: 1, pack: pack.manifest.name, type: found };

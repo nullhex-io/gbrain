@@ -14,6 +14,7 @@
  */
 
 import { describe, test, expect } from 'bun:test';
+import { readFileSync } from 'node:fs';
 import { autoLinkLockKey } from '../src/core/ops/pages.ts';
 import { registerClientNameLockKey } from '../src/commands/agent-register.ts';
 import { slugRegistryLockKey, BrainWriter } from '../src/core/output/writer.ts';
@@ -35,6 +36,13 @@ describe('autoLinkLockKey (ops/pages.ts)', () => {
 
   test('same (source, slug) produces the same key (same-scope writers still serialize)', () => {
     expect(autoLinkLockKey('src-a', 'notes/x')).toBe(autoLinkLockKey('src-a', 'notes/x'));
+  });
+
+  test('inline and sweep reconciliation call the shared key helper', () => {
+    const pages = readFileSync(new URL('../src/core/ops/pages.ts', import.meta.url), 'utf8');
+    const sweep = readFileSync(new URL('../src/core/sweep.ts', import.meta.url), 'utf8');
+    expect(pages).toContain('autoLinkLockKey(pageSourceId, slug)');
+    expect(sweep).toContain('autoLinkLockKey(sourceId, slug)');
   });
 });
 

@@ -1452,6 +1452,18 @@ describe('makeResolver — fallback chain', () => {
     expect(calls.every(c => c.sourceId === 'src-a')).toBe(true);
   });
 
+  test('opts.sourceId is forwarded to the live keyword fallback', async () => {
+    let sawOpts: unknown;
+    const engine = {
+      async getPage() { return null; },
+      async findByTitleFuzzy() { return null; },
+      async searchKeyword(_query: string, opts: unknown) { sawOpts = opts; return []; },
+    } as unknown as BrainEngine;
+    const r = makeResolver(engine, { mode: 'live', sourceId: 'src-a' });
+    await r.resolve('Alice Example', 'people');
+    expect(sawOpts).toEqual({ limit: 3, sourceId: 'src-a' });
+  });
+
   test('opts.sourceId omitted → findByTitleFuzzy receives undefined (back-compat)', async () => {
     const calls: Array<{ sourceId?: string }> = [];
     const engine = {

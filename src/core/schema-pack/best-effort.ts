@@ -22,9 +22,8 @@
 // pack-load problem) — not silent (results look normal but contradict
 // user intent).
 
-import { loadConfig } from '../config.ts';
 import type { OperationContext } from '../operations.ts';
-import { loadActivePack } from './load-active.ts';
+import { loadActivePackForOp } from './op-trust-gate.ts';
 import type { ResolvedPack } from './registry.ts';
 
 /**
@@ -48,11 +47,7 @@ export async function loadActivePackBestEffort(
   ctx: OperationContext,
 ): Promise<ResolvedPack | null> {
   try {
-    return await loadActivePack({
-      cfg: loadConfig(),
-      remote: ctx.remote ?? true,
-      sourceId: ctx.sourceId,
-    });
+    return await loadActivePackForOp(ctx, {});
   } catch {
     return null;
   }

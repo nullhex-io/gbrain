@@ -945,11 +945,10 @@ describe('operation scope annotations', () => {
     // is read-scoped for OAuth/MCP because its handler forces save/take off
     // for remote callers before persistence (pinned by
     // test/takes-mcp-allowlist.serial.test.ts); local CLI can still persist.
-    // WP4/D9: request_tools is read-scoped + mutating — its only write (the
-    // {surface} persist branch) self-enforces the D2 ceiling, the operator
-    // lock, and a per-client rate limit; the read scope keeps discovery
-    // available to every token class (agent scope via the FOV-4 carve-out).
-    const remoteReadOnlyMutatingOps = new Set(['think', 'request_tools']);
+    // WP4/D9: request_tools self-enforces its persistence guards, while delta
+    // persists only a source+client+session cursor. Both are slug-free meta
+    // operations intentionally available to bound clients.
+    const remoteReadOnlyMutatingOps = new Set(['think', 'request_tools', 'delta']);
     for (const op of operations) {
       if (op.mutating) {
         if (remoteReadOnlyMutatingOps.has(op.name)) {

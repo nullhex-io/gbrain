@@ -298,17 +298,12 @@ export const CLIENT_FENCED_WRITE_OPS: ReadonlySet<string> = new Set([
 ]);
 
 /**
- * WP4 (D9) — discovery meta-ops exempt from the bound-client fence's
- * LISTING/dispatch denial. `request_tools` is `mutating: true` (its persist
- * branch writes oauth_clients.surface), which would otherwise hide discovery
- * from every slug-bound client. The exemption is safe because the persist
- * branch SELF-ENFORCES its own guards — server ceiling (D2), operator lock
- * (amendment 19), OAuth scopes, and a per-client rate limit (D14.5) — and it
- * never touches a slug. Lives here (not inline in the predicate) so the
- * tools/list filter and the dispatch fence consume the identical carve-out
- * (ENG-3 drift-proofing).
+ * WP4 (D9) - slug-free meta-ops exempt from the bound-client fence's
+ * LISTING/dispatch denial. `request_tools` persists a surface selection;
+ * `delta` persists only a source+client+session cursor. Neither can touch a
+ * page slug. Lives here so tools/list and dispatch consume the same carve-out.
  */
-export const BOUND_CLIENT_META_OPS: ReadonlySet<string> = new Set(['request_tools']);
+export const BOUND_CLIENT_META_OPS: ReadonlySet<string> = new Set(['request_tools', 'delta']);
 
 /**
  * Single source of truth for "may a slug-bound client use this op" (ENG-3).
@@ -428,16 +423,62 @@ export function sourceScopeOpts(ctx: OperationContext): { sourceId?: string; sou
   // value of `[]` MUST NOT widen scope to "all sources" by being interpreted
   // as "no filter."
   if (allowed && allowed.length > 0) return { sourceIds: allowed };
+  // A malformed/degraded remote OAuth projection can carry an explicit empty
+  // grant without a scalar floor. Keep that as a guaranteed no-read scope,
+  // never `{}` (which engine APIs interpret as unscoped).
+  if (allowed !== undefined && ctx.remote !== false && !ctx.sourceId) {
+    return { sourceId: ALL_SOURCES };
+  }
   // #1712: the __all__ sentinel spans the brain — but ONLY for trusted local
-  // callers (strictly `remote === false`). For remote/untrusted callers the
-  // literal stays as-is: it can never match a real source id (underscores are
-  // rejected at creation), so the read fail-closes to empty rather than
-  // widening past the caller's grant. Do NOT "simplify" this to `{}`.
+  // callers (strictly `remote === false`) or a transport-issued source scope.
+  // Ordinary grantless stdio carries federation; ambient GBRAIN_SOURCE=__all__
+  // carries every active source. Callers cannot smuggle either through tool
+  // params. Without one, retain the unsatisfiable literal so an untrusted
+  // caller fails closed rather than widening past its grant. Do NOT
+  // "simplify" this to `{}`.
   if (ctx.sourceId === ALL_SOURCES) {
-    return ctx.remote === false ? {} : { sourceId: ctx.sourceId };
+    if (ctx.remote === false) return {};
+    if (ctx.auth?.allowedSources === undefined && ctx.localFederatedSourceIds?.length) {
+      return { sourceIds: ctx.localFederatedSourceIds };
+    }
+    return { sourceId: ctx.sourceId };
   }
   if (ctx.sourceId) return { sourceId: ctx.sourceId };
   return {};
+}
+
+/** Resolve handlers backed by scalar engine APIs without passing __all__. */
+export function singleSourceReadId(ctx: OperationContext, opName: string): string {
+  if (ctx.sourceId !== ALL_SOURCES) return ctx.sourceId ?? 'default';
+  const scope = sourceScopeOpts(ctx);
+  if (scope.sourceIds?.length === 1) return scope.sourceIds[0]!;
+  throw new OperationError(
+    'source_binding_required',
+    `${opName} reads one source at a time; GBRAIN_SOURCE=__all__ requires a concrete source binding.`,
+    'Set GBRAIN_SOURCE=<source-id>, or invoke this operation through a single-source connection.',
+  );
+}
+
+/**
+ * `__all__` is a read-span sentinel, never a write target. Keep this fence at
+ * the operation-scope layer so MCP dispatch, direct CLI invocation, and the
+ * trusted `gbrain call` compatibility path cannot drift into different write
+ * behavior. Multi-source read handlers turn the sentinel into an explicit
+ * server-issued scope or a trusted-local whole-brain view. Intrinsically
+ * single-source reads require a concrete source binding.
+ */
+export function allSourcesWriteFenceError(
+  sourceId: string | undefined,
+  op: Pick<Operation, 'scope' | 'mutating'>,
+): OperationError | undefined {
+  if (sourceId !== ALL_SOURCES || (op.scope === 'read' && op.mutating !== true)) return undefined;
+  return new OperationError(
+    'source_binding_required',
+    'GBRAIN_SOURCE=__all__ is a read-span sentinel, not a write target. A write cannot resolve to "all sources". ' +
+      'Set GBRAIN_SOURCE to a concrete source id for writes.',
+    'Set GBRAIN_SOURCE=<source-id> in the environment that launches this command. ' +
+      'List sources with `gbrain sources list`. Multi-source reads remain available; intrinsically single-source reads require a concrete source binding.',
+  );
 }
 
 /** Map the operation-layer scope names onto runThink's public options. */
@@ -489,9 +530,10 @@ export function linkReadScopeOpts(ctx: OperationContext): { sourceId?: string; s
  *
  *   - `__all__` / `all_sources`:
  *       trusted local (remote === false) → `{}` (spans the whole brain)
- *       remote                           → the caller's grant (sourceScopeOpts)
+ *       remote + transport-issued stdio scope → that issued scope
+ *       other remote callers                    → the caller's grant (sourceScopeOpts)
  *   - explicit `source_id`:
- *       remote + federated grant that doesn't include it → permission_denied
+ *       remote + explicit federated grant that doesn't include it → permission_denied
  *       otherwise                                        → `{ sourceId }`
  *   - neither → the caller's grant (sourceScopeOpts).
  *
@@ -505,11 +547,22 @@ export function resolveRequestedScope(
 ): { sourceId?: string; sourceIds?: string[] } {
   const wantsAll = allSourcesParam || sourceIdParam === ALL_SOURCES;
   if (wantsAll) {
-    return ctx.remote === false ? {} : sourceScopeOpts(ctx);
+    if (ctx.remote === false) return {};
+    // The capability is the transport-populated list itself. It is never read
+    // from caller params, and OAuth's explicit grant (including []) remains
+    // authoritative over a local stdio-style federation list.
+    if (ctx.auth?.allowedSources === undefined && ctx.localFederatedSourceIds?.length) {
+      return { sourceIds: ctx.localFederatedSourceIds };
+    }
+    return sourceScopeOpts(ctx);
   }
   if (sourceIdParam !== undefined) {
     const allowed = ctx.auth?.allowedSources;
-    if (ctx.remote !== false && allowed && allowed.length > 0 && !allowed.includes(sourceIdParam)) {
+    const granted = allowed === undefined
+      || (allowed.length > 0
+        ? allowed.includes(sourceIdParam)
+        : ctx.sourceId === sourceIdParam);
+    if (ctx.remote !== false && !granted) {
       throw new OperationError(
         'permission_denied',
         `source '${sourceIdParam}' is outside your granted sources`,
@@ -533,11 +586,15 @@ export function resolveRequestedScope(
  * were invisible to get_page/search/list_pages while resolve_slugs leaked them).
  *
  * The expansion NEVER applies when:
- *   - a per-call `source_id` was passed (explicit wins, including `__all__`);
+ *   - a concrete per-call `source_id` was passed (explicit wins);
  *   - the resolver already produced a federated array (OAuth grant governs);
  *   - the transport didn't populate `localFederatedSourceIds` (see that
- *     field's doc: it is only set for callers with NO explicit source scope,
+ *     field's doc: it is transport-computed,
  *     and never from caller-controlled params — so trust stays fail-closed).
+ *
+ * `__all__` resolution, including its transport-issued capability, is owned
+ * by `resolveRequestedScope`; this helper widens only unqualified scalar
+ * reads. OAuth grants are never widened.
  *
  * Deliberately NOT inside `sourceScopeOpts`: code-intel ops collapse a
  * multi-element scope to an error (`resolveCodeIntelScope`), and the remaining
@@ -550,6 +607,7 @@ export function federatedSearchScope(
   const scope = resolveRequestedScope(ctx, sourceIdParam);
   if (
     sourceIdParam === undefined &&
+    ctx.auth?.allowedSources === undefined &&
     scope.sourceId !== undefined &&
     scope.sourceIds === undefined &&
     ctx.localFederatedSourceIds !== undefined &&

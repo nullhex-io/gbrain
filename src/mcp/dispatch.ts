@@ -13,6 +13,7 @@ import { loadConfig } from '../core/config.ts';
 import { VERB_NAMES, MEMORY_VERBS_VERSION } from '../core/verbs.ts';
 import { logVerbUsage } from '../core/verbs/usage-log.ts';
 import { sourceGuardBlocksWrite } from '../core/source-resolver.ts';
+import { allSourcesWriteFenceError } from '../core/ops/context.ts';
 import { suggestNearest } from '../core/levenshtein.ts';
 import {
   normalizeOptionalParams,
@@ -460,37 +461,34 @@ export async function dispatchToolCall(
     return unknownToolEnvelope(name, opts.allowedOps);
   }
 
-  // --source-guard (plugin lanes): fail-closed write routing. A user-global
-  // plugin serve has no per-workspace source binding, so an ambient-tier
-  // resolution must not be allowed to WRITE into whatever source it happened
-  // to fall through to. Enforced before validation so a blocked caller
-  // learns the routing rule, not the op's parameter shape.
-  if (opts.sourceGuardTier && op.scope !== 'read') {
-    // The `__all__` read-span sentinel can never be a valid WRITE target (no
-    // source has that id — the write would die downstream on the FK). Under
-    // the guard, block it with a sentinel-specific hint rather than the
-    // generic ambiguity copy. This is independent of the tier probe below.
-    const sentinelWrite = opts.sourceId === '__all__';
-    if (sentinelWrite || (await sourceGuardBlocksWrite(engine, opts.sourceGuardTier))) {
-      logVerb(false);
-      const envelope = {
-        error: 'source_binding_required',
-        message: sentinelWrite
-          ? 'GBRAIN_SOURCE=__all__ is a read-span sentinel, not a write target — a write cannot resolve to "all sources". ' +
-            'Set GBRAIN_SOURCE to a concrete source id for writes.'
-          : 'This brain has more than one source to choose from and the MCP server runs with --source-guard: ' +
-          `write/admin operations need an explicit source binding so they cannot land in the wrong source (resolution tier: ${opts.sourceGuardTier}).`,
-        suggestion:
-          'Set GBRAIN_SOURCE=<source-id> in the environment that launches this MCP server ' +
+  // Fail-closed write routing. The `__all__` read-span sentinel is never a
+  // write target, including on the default serve where --source-guard is off.
+  // The optional guard additionally rejects ambiguous non-sentinel bindings
+  // in plugin lanes. Enforce both before validation so callers receive the
+  // routing rule rather than an operation-shape error.
+  const allSourcesFence = allSourcesWriteFenceError(opts.sourceId, op);
+  if (
+    allSourcesFence ||
+    (op.scope !== 'read' && opts.sourceGuardTier && await sourceGuardBlocksWrite(engine, opts.sourceGuardTier))
+  ) {
+    logVerb(false);
+    const envelope = {
+      error: 'source_binding_required',
+      message: allSourcesFence
+        ? allSourcesFence.message
+        : 'This brain has more than one source to choose from and the MCP server runs with --source-guard: ' +
+        `write/admin operations need an explicit source binding so they cannot land in the wrong source (resolution tier: ${opts.sourceGuardTier}).`,
+      suggestion:
+        allSourcesFence?.suggestion ??
+        ('Set GBRAIN_SOURCE=<source-id> in the environment that launches this MCP server ' +
           '(plugin installs pass it through — the user-global stdio serve binds the source from the env, not a flag). ' +
-          'List sources with `gbrain sources list`. Reads are unaffected.',
-        ...(isVerb ? { protocol_version: MEMORY_VERBS_VERSION } : {}),
-      };
-      return {
-        content: [{ type: 'text', text: JSON.stringify(envelope, null, 2) }],
-        isError: true,
-      };
-    }
+          'List sources with `gbrain sources list`. Reads are unaffected.'),
+      ...(isVerb ? { protocol_version: MEMORY_VERBS_VERSION } : {}),
+    };
+    return {
+      content: [{ type: 'text', text: JSON.stringify(envelope, null, 2) }],
+      isError: true,
+    };
   }
 
   const safeParams = normalizeOptionalParams(op, params || {});

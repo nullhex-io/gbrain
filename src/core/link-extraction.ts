@@ -476,9 +476,7 @@ function resolveRelativeSlug(pageSlug: string, ref: EntityRef): string {
   const keep = Math.max(0, dirSegs.length - ref.upLevels);
   return [...dirSegs.slice(0, keep), ref.slug].join('/');
 }
-
 // ─── Link candidates (richer than EntityRef) ────────────────────
-
 export interface LinkCandidate {
   /**
    * Source page slug for the edge. When omitted, callers default to
@@ -491,6 +489,8 @@ export interface LinkCandidate {
   fromSlug?: string;
   /** Target page slug (no .md, no ../). */
   targetSlug: string;
+  /** Qualified wikilink source; unqualified refs resolve local-first. */
+  targetSourceId?: string;
   /** Inferred relationship type. */
   linkType: string;
   /** Surrounding text (up to ~80 chars) used for inference + storage. */
@@ -633,6 +633,7 @@ export async function extractPageLinks(
     const targetSlug = resolveRelativeSlug(slug, ref);
     candidates.push({
       targetSlug,
+      ...(ref.sourceId ? { targetSourceId: ref.sourceId } : {}),
       linkType: inferLinkType(pageType, context, content, targetSlug),
       context,
       linkSource: 'markdown',
@@ -688,8 +689,7 @@ export async function extractPageLinks(
     fmUnresolved = fm.unresolved;
   }
 
-  // Within-page dedup: same (fromSlug, targetSlug, linkType, linkSource)
-  // collapses to one entry. First occurrence wins.
+  // Within-page dedup includes endpoint source. First occurrence wins.
   // Issue #972 (codex P2d, decided): a qualified `[[companies/acme]]` (typed
   // markdown edge) and a bare `[[acme]]` (wikilink-resolved edge) to the SAME
   // target are KEPT as separate rows — they carry different provenance
@@ -699,7 +699,7 @@ export async function extractPageLinks(
   const seen = new Set<string>();
   const result: LinkCandidate[] = [];
   for (const c of candidates) {
-    const key = `${c.fromSlug ?? ''}\u0000${c.targetSlug}\u0000${c.linkType}\u0000${c.linkSource ?? ''}`;
+    const key = `${c.fromSlug ?? ''}\u0000${c.targetSourceId ?? ''}\u0000${c.targetSlug}\u0000${c.linkType}\u0000${c.linkSource ?? ''}`;
     if (seen.has(key)) continue;
     seen.add(key);
     result.push(c);
@@ -1143,7 +1143,7 @@ export function makeResolver(
       // mode skips this step entirely to keep migration deterministic.
       if (opts.mode === 'live') {
         try {
-          const results = await engine.searchKeyword(trimmed, { limit: 3 });
+          const results = await engine.searchKeyword(trimmed, { limit: 3, sourceId: opts.sourceId });
           if (results.length > 0 && results[0].score >= 0.8) {
             // Filter by dir hint if provided.
             const top = hints.length > 0

@@ -14,7 +14,7 @@
 
 import type { Operation } from './contract.ts';
 import { OperationError, verbError } from './contract.ts';
-import { sourceScopeOpts, stampEvidenceSafe } from './context.ts';
+import { singleSourceReadId, sourceScopeOpts, stampEvidenceSafe } from './context.ts';
 import { hybridSearchCached, stampContentFlags } from '../search/hybrid.ts';
 import { dedupResults } from '../search/dedup.ts';
 import { bumpLastRetrievedAt } from '../last-retrieved.ts';
@@ -413,7 +413,7 @@ const context_pack: Operation = {
   annotations: { title: 'context_pack (boundary bundle)', readOnlyHint: true },
   handler: async (ctx, p) => {
     const { assembleContextPack, renderPack, isAfter, PACK_DEFAULT_MAX_ENTITIES } = await import('../context/turn-context.ts');
-    const sourceId = ctx.sourceId ?? 'default';
+    const sourceId = singleSourceReadId(ctx, 'context_pack');
     const rawSince = typeof p.since === 'string' && p.since.trim() ? p.since : undefined;
     if (rawSince !== undefined && !Number.isFinite(Date.parse(rawSince))) {
       throw verbError(
@@ -516,13 +516,14 @@ const delta: Operation = {
     include_private: { type: 'boolean', description: 'Local trusted callers only: widen ALL arms to include private facts. Ignored (world-only) for remote callers. Default false.' },
   },
   scope: 'read',
+  mutating: true,
   verb: true,
   cliHints: { name: 'delta' },
-  annotations: { title: 'delta (what changed since)', readOnlyHint: true },
+  annotations: { title: 'delta (what changed since)' },
   handler: async (ctx, p) => {
     const { assembleDeltaContext, renderDelta, PACK_DEFAULT_MAX_ENTITIES } = await import('../context/turn-context.ts');
     const { getSessionContextState, upsertSessionContextState } = await import('../context/session-state.ts');
-    const sourceId = ctx.sourceId ?? 'default';
+    const sourceId = singleSourceReadId(ctx, 'delta');
     const rawSince = typeof p.since === 'string' && p.since.trim() ? p.since : null;
     if (rawSince !== null && !Number.isFinite(Date.parse(rawSince))) {
       throw verbError(

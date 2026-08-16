@@ -12,7 +12,7 @@ import { clampSearchLimit } from '../engine.ts';
 import type { PageType } from '../types.ts';
 import { importFromContent } from '../import-file.ts';
 import { writePageThrough, type WriteThroughResult } from '../write-through.ts';
-import { extractPageLinks, isAutoLinkEnabled, isAutoTimelineEnabled, isGlobalBasenameEnabled, parseTimelineEntries, makeResolver, type UnresolvedFrontmatterRef } from '../link-extraction.ts';
+import { extractPageLinks, isAutoLinkEnabled, isAutoTimelineEnabled, isGlobalBasenameEnabled, parseTimelineEntries, makeResolver, type SlugResolver, type UnresolvedFrontmatterRef } from '../link-extraction.ts';
 import { isFactsBackstopEligible } from '../facts/eligibility.ts';
 import { stripTakesFence } from '../takes-fence.ts';
 import type { WriterLintPayload } from '../output/post-write.ts';
@@ -20,6 +20,7 @@ import { stripFactsFence } from '../facts-fence.ts';
 import { getContentFlag } from '../quarantine.ts';
 import { bumpLastRetrievedAt } from '../last-retrieved.ts';
 import { LIST_PAGES_DESCRIPTION, CAPTURE_DESCRIPTION } from '../operations-descriptions.ts';
+import { autoLinkLockKey, lookupLinkCandidateSources, resolveCandidateSources } from '../link-source-resolution.ts';
 import { OperationError } from './contract.ts';
 import type { Operation } from './contract.ts';
 import {
@@ -29,6 +30,7 @@ import {
   federatedSearchScope,
   normalizeSlugPrefix,
   validatePageSlug,
+  allSourcesWriteFenceError,
 } from './context.ts';
 
 // --- Page CRUD ---
@@ -156,6 +158,9 @@ const put_page: Operation = {
   mutating: true,
   scope: 'write',
   handler: async (ctx, p) => {
+    const allSourcesFence = allSourcesWriteFenceError(ctx.sourceId, put_page);
+    if (allSourcesFence) throw allSourcesFence;
+
     const slug = p.slug as string;
 
     // v0.39.3.0 CV6 trust gate for provenance write-through (WARN-8).
@@ -567,19 +572,7 @@ const put_page: Operation = {
 // so sync.ts, file_upload, code_import, and runFactsBackstop all share one
 // predicate. Imported above.
 
-/**
- * Advisory-lock key for the auto-link reconciliation critical section.
- * Source-scoped (PR6 D5): two concurrent put_page calls on the SAME slug in
- * DIFFERENT sources reconcile disjoint link rows — a shared `auto_link:${slug}`
- * key serialized them for no correctness benefit (cross-source contention),
- * while same-(source, slug) writers still serialize. runAutoLink has two
- * callers (the put_page handler above and autoLinkWrittenPage below), both
- * lock-covered inside runAutoLink itself; the `?? ''` fallback is
- * belt-and-braces only, never a real key shape.
- */
-export function autoLinkLockKey(sourceId: string | undefined, slug: string): string {
-  return `auto_link:${sourceId ?? ''}:${slug}`;
-}
+export { autoLinkLockKey };
 
 /**
  * #4216 post-batch auto-link reconciliation for the oneshot runner.
@@ -634,20 +627,10 @@ async function runAutoLink(
   opts?: { sourceId?: string },
 ): Promise<{ created: number; removed: number; errors: number; unresolved: UnresolvedFrontmatterRef[] }> {
   const fullContent = parsed.compiled_truth + '\n' + parsed.timeline;
-  // v0.31.8 (codex OV-2): thread sourceId through every read + write inside
-  // reconcileLinks. Without this the FS walker reads cross-source links/slugs
-  // but writes scoped to one source — phantom stale-deletions and duplicate
-  // inserts. runAutoLink has exactly ONE caller (the put_page handler) and
-  // ctx.sourceId is a REQUIRED string there, so opts.sourceId is always set in
-  // practice; the omitted-opts branches below (and the `?? ''` in
-  // autoLinkLockKey) are belt-and-braces only, not a live back-compat path.
-  const sourceOpts = opts?.sourceId ? { sourceId: opts.sourceId } : {};
-  const linkSourceOpts = opts?.sourceId
-    ? { fromSourceId: opts.sourceId, toSourceId: opts.sourceId, originSourceId: opts.sourceId }
-    : {};
-  const removeSourceOpts = opts?.sourceId
-    ? { fromSourceId: opts.sourceId, toSourceId: opts.sourceId }
-    : {};
+  // Reconcile only the actual writer page. The operation writes without an
+  // explicit source to `default`, so that legacy call has an exact source too.
+  const pageSourceId = opts?.sourceId ?? 'default';
+  const sourceOpts = { sourceId: pageSourceId };
 
   // Live-mode resolver: per-put throwaway cache, pg_trgm + optional search.
   // Issue #972 (codex [P1]): pass sourceId so basename resolution stays
@@ -656,7 +639,19 @@ async function runAutoLink(
   // targeting — without it, cross-source slug suggestions get silently dropped
   // at the FK filter and the link looks like it failed to resolve. Twin of
   // #1436's `tryFuzzyMatch` fix.
-  const resolver = makeResolver(engine, { mode: 'live', sourceId: opts?.sourceId });
+  const localResolver = makeResolver(engine, { mode: 'live', sourceId: pageSourceId });
+  const defaultResolver = pageSourceId === 'default'
+    ? undefined
+    : makeResolver(engine, { mode: 'live', sourceId: 'default' });
+  const resolver: SlugResolver = defaultResolver ? {
+    async resolve(name, dirHint) {
+      return await localResolver.resolve(name, dirHint) ?? defaultResolver.resolve(name, dirHint);
+    },
+    async resolveBasenameMatches(name) {
+      const local = await localResolver.resolveBasenameMatches!(name);
+      return local.length > 0 ? local : defaultResolver.resolveBasenameMatches!(name);
+    },
+  } : localResolver;
   // Issue #972: opt-in bare-wikilink basename resolution. Off by default.
   const globalBasename = await isGlobalBasenameEnabled(engine);
   const { candidates, unresolved } = await extractPageLinks(
@@ -664,14 +659,20 @@ async function runAutoLink(
     { globalBasename },
   );
 
-  // Resolve which targets exist (skip refs to non-existent pages to avoid FK
-  // violation churn in addLink). One getAllSlugs call upfront, O(1) lookup.
-  // v0.31.8 (D12): scoped to the source when opts.sourceId is set so wikilink
-  // resolution doesn't span unrelated sources.
-  const allSlugs = await engine.getAllSlugs(sourceOpts);
-  const valid = candidates.filter(c =>
-    allSlugs.has(c.targetSlug) && (!c.fromSlug || allSlugs.has(c.fromSlug))
-  );
+  // Resolve candidate endpoints by their composite `(source_id, slug)`
+  // identities. This is a bounded lookup over just the extracted slugs, not a
+  // whole-brain scan. It matches sweep/extract's local-first then default
+  // fallback, while qualified wikilinks stay pinned to their named source.
+  const needed = new Set<string>([slug]);
+  for (const candidate of candidates) {
+    needed.add(candidate.targetSlug);
+    if (candidate.fromSlug) needed.add(candidate.fromSlug);
+  }
+  const sourceLookup = await lookupLinkCandidateSources(engine, needed);
+  const valid = candidates.flatMap((candidate) => {
+    const resolved = resolveCandidateSources(candidate, slug, pageSourceId, sourceLookup);
+    return resolved ? [{ ...candidate, ...resolved }] : [];
+  });
 
   // Split candidates by direction. Outgoing (fromSlug === slug or unset) are
   // this page's own edges, reconciled against getLinks(slug). Incoming
@@ -701,7 +702,7 @@ async function runAutoLink(
       // below — a primitive that errored on either engine would quietly drop
       // the lock entirely. hashtext is the primitive every advisory-lock site
       // in this repo already proves on both engines; keep the family uniform.
-      await tx.executeRaw(`SELECT pg_advisory_xact_lock(hashtext($1)::bigint)`, [autoLinkLockKey(opts?.sourceId, slug)]);
+      await tx.executeRaw(`SELECT pg_advisory_xact_lock(hashtext($1)::bigint)`, [autoLinkLockKey(pageSourceId, slug)]);
     } catch {
       // engine doesn't support advisory locks — fall through
     }
@@ -710,7 +711,7 @@ async function runAutoLink(
     // Non-frontmatter and other-page frontmatter edges survive untouched.
     const existingInRaw = await tx.getBacklinks(slug, sourceOpts);
     const existingIn = existingInRaw.filter(
-      l => l.link_source === 'frontmatter' && l.origin_slug === slug,
+      l => l.link_source === 'frontmatter' && l.origin_slug === slug && l.origin_source_id === pageSourceId,
     );
 
     // Reconcilable outgoing edges: markdown + our own frontmatter edges +
@@ -724,14 +725,14 @@ async function runAutoLink(
     const reconcilableOut = existingOut.filter(
       l => l.link_source === 'markdown' || l.link_source == null ||
            l.link_source === 'wikilink-resolved' ||
-           (l.link_source === 'frontmatter' && l.origin_slug === slug),
+           (l.link_source === 'frontmatter' && l.origin_slug === slug && l.origin_source_id === pageSourceId),
     );
 
     const outKeys = new Set(out.map(c =>
-      `${c.targetSlug}\u0000${c.linkType}\u0000${c.linkSource ?? 'markdown'}`
+      `${c.toSourceId}\u0000${c.targetSlug}\u0000${c.linkType}\u0000${c.linkSource ?? 'markdown'}`
     ));
     const incKeys = new Set(inc.map(c =>
-      `${c.fromSlug}\u0000${c.linkType}`
+      `${c.fromSourceId}\u0000${c.fromSlug}\u0000${c.linkType}`
     ));
 
     let created = 0, removed = 0, errors = 0;
@@ -740,13 +741,17 @@ async function runAutoLink(
     for (const c of out) {
       try {
         await tx.addLink(
-          slug, c.targetSlug, c.context, c.linkType,
+          c.fromSlug ?? slug, c.targetSlug, c.context, c.linkType,
           c.linkSource, c.originSlug, c.originField,
-          linkSourceOpts,
+          {
+            fromSourceId: c.fromSourceId,
+            toSourceId: c.toSourceId,
+            originSourceId: pageSourceId,
+          },
         );
-        const existKey = `${c.targetSlug}\u0000${c.linkType}\u0000${c.linkSource ?? 'markdown'}`;
+        const existKey = `${c.toSourceId}\u0000${c.targetSlug}\u0000${c.linkType}\u0000${c.linkSource ?? 'markdown'}`;
         const exists = reconcilableOut.some(l =>
-          `${l.to_slug}\u0000${l.link_type}\u0000${l.link_source ?? 'markdown'}` === existKey
+          `${l.to_source_id}\u0000${l.to_slug}\u0000${l.link_type}\u0000${l.link_source ?? 'markdown'}` === existKey
         );
         if (!exists) created++;
       } catch {
@@ -760,11 +765,15 @@ async function runAutoLink(
         await tx.addLink(
           c.fromSlug!, c.targetSlug, c.context, c.linkType,
           'frontmatter', c.originSlug, c.originField,
-          linkSourceOpts,
+          {
+            fromSourceId: c.fromSourceId,
+            toSourceId: c.toSourceId,
+            originSourceId: pageSourceId,
+          },
         );
-        const existKey = `${c.fromSlug}\u0000${c.linkType}`;
+        const existKey = `${c.fromSourceId}\u0000${c.fromSlug}\u0000${c.linkType}`;
         const exists = existingIn.some(l =>
-          `${l.from_slug}\u0000${l.link_type}` === existKey
+          `${l.from_source_id}\u0000${l.from_slug}\u0000${l.link_type}` === existKey
         );
         if (!exists) created++;
       } catch {
@@ -774,10 +783,20 @@ async function runAutoLink(
 
     // Remove stale outgoing (markdown or our-frontmatter, not in desired set).
     for (const l of reconcilableOut) {
-      const key = `${l.to_slug}\u0000${l.link_type}\u0000${l.link_source ?? 'markdown'}`;
+      const key = `${l.to_source_id}\u0000${l.to_slug}\u0000${l.link_type}\u0000${l.link_source ?? 'markdown'}`;
       if (!outKeys.has(key)) {
         try {
-          await tx.removeLink(slug, l.to_slug, l.link_type, l.link_source ?? undefined, removeSourceOpts);
+          // getLinks(sourceId) scopes the writer only, so a managed edge may
+          // still point at a target in another source. Delete the exact row
+          // returned by the projection rather than assuming both endpoints
+          // share the writer's source.
+          await tx.removeLink(slug, l.to_slug, l.link_type, l.link_source, {
+            fromSourceId: l.from_source_id,
+            toSourceId: l.to_source_id,
+            ...(l.link_source === 'frontmatter'
+              ? { originSlug: slug, originSourceId: pageSourceId }
+              : {}),
+          });
           removed++;
         } catch {
           errors++;
@@ -787,10 +806,15 @@ async function runAutoLink(
 
     // Remove stale incoming (our frontmatter → slug, not in desired set).
     for (const l of existingIn) {
-      const key = `${l.from_slug}\u0000${l.link_type}`;
+      const key = `${l.from_source_id}\u0000${l.from_slug}\u0000${l.link_type}`;
       if (!incKeys.has(key)) {
         try {
-          await tx.removeLink(l.from_slug, slug, l.link_type, 'frontmatter', removeSourceOpts);
+          await tx.removeLink(l.from_slug, slug, l.link_type, 'frontmatter', {
+            fromSourceId: l.from_source_id,
+            toSourceId: l.to_source_id,
+            originSlug: slug,
+            originSourceId: pageSourceId,
+          });
           removed++;
         } catch {
           errors++;
