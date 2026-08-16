@@ -1,0 +1,117 @@
+/**
+ * Real-Postgres regression for maintenance-sweep link reconciliation.
+ *
+ * The transaction-scoped reconciler must remain compatible with optional RLS
+ * scope binding. Calling a scoped engine read from the transaction clone would
+ * try to open a nested postgres.js transaction and fail before pruning stale
+ * links. The self-retrying batch helper also cannot be called from inside the
+ * outer transaction. This test enables the production flag, forbids that
+ * helper, and proves that managed rows are removed while manual provenance
+ * survives.
+ */
+import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
+
+import type { BrainEngine } from '../../src/core/engine.ts';
+import type { CapabilityReport } from '../../src/core/capability.ts';
+import { runMaintenanceSweep } from '../../src/core/sweep.ts';
+import { getEngine, hasDatabase, setupDB, teardownDB } from './helpers.ts';
+
+const describePostgres = hasDatabase() ? describe : describe.skip;
+
+const KEYLESS: CapabilityReport = {
+  embeddings: { available: false },
+  extraction: { available: false },
+  search: 'keyword-only',
+  mode: 'keyless',
+};
+
+describePostgres('maintenance sweep link reconciliation on Postgres', () => {
+  let engine: BrainEngine;
+
+  beforeAll(async () => {
+    await setupDB();
+    engine = getEngine();
+  }, 90_000);
+
+  afterAll(async () => {
+    await teardownDB();
+  }, 30_000);
+
+  test('uses an RLS-safe transaction-local batch and prunes stale managed edges', async () => {
+    await engine.putPage('concepts/pg-sweep-target', {
+      type: 'concept',
+      title: 'Postgres sweep target',
+      compiled_truth: 'Target page.',
+      timeline: '',
+    });
+    await engine.putPage('notes/pg-sweep-writer', {
+      type: 'note',
+      title: 'Postgres sweep writer',
+      compiled_truth: 'References [the target](concepts/pg-sweep-target).',
+      timeline: '',
+    });
+    await engine.executeRaw(
+      `UPDATE pages
+          SET links_extracted_at = updated_at
+        WHERE slug = 'concepts/pg-sweep-target'
+          AND source_id = 'default'`,
+    );
+
+    const previousRls = process.env.GBRAIN_RLS_SCOPE_BINDING;
+    const ownAddLinksBatch = Object.getOwnPropertyDescriptor(engine, 'addLinksBatch');
+    process.env.GBRAIN_RLS_SCOPE_BINDING = '1';
+    Object.defineProperty(engine, 'addLinksBatch', {
+      configurable: true,
+      value: async () => {
+        throw new Error('self-retrying addLinksBatch is forbidden in a sweep transaction');
+      },
+    });
+    try {
+      const initial = await runMaintenanceSweep(engine, {
+        sourceId: 'default',
+        capabilities: KEYLESS,
+      });
+      expect(initial.linksExtracted).toBe(1);
+      await engine.addLink(
+        'notes/pg-sweep-writer',
+        'concepts/pg-sweep-target',
+        'Operator-authored edge',
+        'mentions',
+        'manual',
+      );
+      await engine.executeRaw(
+        `UPDATE pages
+            SET compiled_truth = 'The reference is gone.',
+                updated_at = $1
+          WHERE slug = 'notes/pg-sweep-writer'
+            AND source_id = 'default'`,
+        [new Date(Date.now() + 1_000).toISOString()],
+      );
+
+      const reconciled = await runMaintenanceSweep(engine, {
+        sourceId: 'default',
+        capabilities: KEYLESS,
+      });
+      expect(reconciled.skipped.map(item => item.reason)).not.toContain('links_timeline_error');
+      expect(reconciled.linksRemoved).toBe(1);
+    } finally {
+      if (ownAddLinksBatch) Object.defineProperty(engine, 'addLinksBatch', ownAddLinksBatch);
+      else delete (engine as unknown as { addLinksBatch?: unknown }).addLinksBatch;
+      if (previousRls === undefined) delete process.env.GBRAIN_RLS_SCOPE_BINDING;
+      else process.env.GBRAIN_RLS_SCOPE_BINDING = previousRls;
+    }
+
+    const remaining = await engine.executeRaw<{ link_source: string }>(
+      `SELECT l.link_source
+         FROM links l
+         JOIN pages f ON f.id = l.from_page_id
+         JOIN pages t ON t.id = l.to_page_id
+        WHERE f.slug = 'notes/pg-sweep-writer'
+          AND f.source_id = 'default'
+          AND t.slug = 'concepts/pg-sweep-target'
+          AND t.source_id = 'default'
+        ORDER BY l.link_source`,
+    );
+    expect(remaining.map(row => row.link_source)).toEqual(['manual']);
+  }, 60_000);
+});

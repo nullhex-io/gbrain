@@ -60,6 +60,8 @@ beforeEach(async () => {
   await engine.executeRaw('DELETE FROM timeline_entries').catch(() => {});
   await engine.executeRaw('DELETE FROM facts').catch(() => {});
   await engine.executeRaw('DELETE FROM pages').catch(() => {});
+  const cursorKeys = await engine.listConfigKeys('sweep.links_timeline.cursor.v1.');
+  await Promise.all(cursorKeys.map(key => engine.unsetConfig(key)));
   // Isolate the corpus pass to a fresh empty dir every test — the default
   // (~/.gbrain/transcripts/corpus) may exist with real files on a dev box.
   corpusDir = mkdtempSync(join(tmpdir(), 'gbrain-sweep-corpus-'));
@@ -185,6 +187,732 @@ describe('runMaintenanceSweep — link/timeline extraction [CX-P0.3]', () => {
         WHERE p.slug = 'notes/meeting-example' AND t.date = '2026-01-02'`,
     );
     expect(parseInt(tl[0].n, 10)).toBe(1);
+  });
+
+  test('removed markdown refs are pruned while manual edges survive', async () => {
+    await seedPage('concepts/sweep-target', 'concept', 'Target page.');
+    await seedPage(
+      'notes/sweep-writer',
+      'note',
+      'References [the target](concepts/sweep-target).',
+    );
+
+    const initial = await runMaintenanceSweep(engine, {
+      sourceId: 'default',
+      capabilities: KEYLESS,
+    });
+    expect(initial.linksExtracted).toBe(1);
+    expect(initial.linksRemoved).toBe(0);
+    await engine.addLink(
+      'notes/sweep-writer',
+      'concepts/sweep-target',
+      'Operator-authored edge',
+      'mentions',
+      'manual',
+    );
+
+    await engine.executeRaw(
+      `UPDATE pages
+          SET compiled_truth = 'The reference is gone.',
+              updated_at = $1
+        WHERE slug = 'notes/sweep-writer' AND source_id = 'default'`,
+      [new Date(Date.now() + 1_000).toISOString()],
+    );
+
+    const reconciled = await runMaintenanceSweep(engine, {
+      sourceId: 'default',
+      capabilities: KEYLESS,
+    });
+    expect(reconciled.linksExtracted).toBe(0);
+    expect(reconciled.linksRemoved).toBe(1);
+
+    const rows = await engine.executeRaw<{ link_source: string | null }>(
+      `SELECT l.link_source
+         FROM links l
+         JOIN pages pf ON pf.id = l.from_page_id
+         JOIN pages pt ON pt.id = l.to_page_id
+        WHERE pf.slug = 'notes/sweep-writer'
+          AND pf.source_id = 'default'
+          AND pt.slug = 'concepts/sweep-target'
+          AND pt.source_id = 'default'
+        ORDER BY l.link_source`,
+    );
+    expect(rows.map(row => row.link_source)).toEqual(['manual']);
+  });
+
+  test('removed cross-source refs delete the exact foreign-target edge', async () => {
+    await engine.executeRaw(
+      `INSERT INTO sources (id, name)
+       VALUES ('media-corpus', 'media-corpus')
+       ON CONFLICT (id) DO NOTHING`,
+    );
+    await seedPage('concepts/cross-source-target', 'concept', 'Default-source target.');
+    await engine.executeRaw(
+      `INSERT INTO pages (slug, source_id, type, title, compiled_truth, timeline)
+       VALUES ('notes/cross-source-writer', 'media-corpus', 'note',
+               'cross-source-writer',
+               'References [the target](concepts/cross-source-target).', '')`,
+    );
+
+    await runMaintenanceSweep(engine, {
+      sourceId: 'media-corpus',
+      capabilities: KEYLESS,
+    });
+    const before = await engine.getLinks('notes/cross-source-writer', {
+      sourceId: 'media-corpus',
+    });
+    expect(before).toHaveLength(1);
+    expect(before[0].to_source_id).toBe('default');
+
+    await engine.executeRaw(
+      `UPDATE pages
+          SET compiled_truth = 'The reference is gone.',
+              updated_at = $1
+        WHERE slug = 'notes/cross-source-writer'
+          AND source_id = 'media-corpus'`,
+      [new Date(Date.now() + 1_000).toISOString()],
+    );
+
+    await runMaintenanceSweep(engine, {
+      sourceId: 'media-corpus',
+      capabilities: KEYLESS,
+    });
+    expect(await engine.getLinks('notes/cross-source-writer', {
+      sourceId: 'media-corpus',
+    })).toHaveLength(0);
+  });
+
+  test('obsolete basename-resolved links are part of the managed set', async () => {
+    await seedPage('projects/resolved-target', 'project', 'Target page.');
+    await seedPage('notes/resolved-writer', 'note', 'The old wikilink is gone.');
+    await engine.addLink(
+      'notes/resolved-writer',
+      'projects/resolved-target',
+      '[[resolved-target]]',
+      'wikilink_basename',
+      'wikilink-resolved',
+    );
+
+    const reconciled = await runMaintenanceSweep(engine, {
+      sourceId: 'default',
+      capabilities: KEYLESS,
+    });
+    expect(reconciled.linksRemoved).toBe(1);
+    expect(await engine.getLinks('notes/resolved-writer', {
+      sourceId: 'default',
+    })).toHaveLength(0);
+  });
+
+  test('a recoverable soft-deleted target keeps its managed edge', async () => {
+    await seedPage('concepts/soft-target', 'concept', 'Target page.');
+    await seedPage(
+      'notes/soft-writer',
+      'note',
+      'References [the target](concepts/soft-target).',
+    );
+    await runMaintenanceSweep(engine, {
+      sourceId: 'default',
+      capabilities: KEYLESS,
+    });
+    expect(await engine.getLinks('notes/soft-writer', {
+      sourceId: 'default',
+    })).toHaveLength(1);
+
+    await engine.softDeletePage('concepts/soft-target', { sourceId: 'default' });
+    await engine.executeRaw(
+      `UPDATE pages
+          SET compiled_truth = $1,
+              updated_at = $2
+        WHERE slug = 'notes/soft-writer' AND source_id = 'default'`,
+      [
+        'Still references [the target](concepts/soft-target). Edited.',
+        new Date(Date.now() + 1_000).toISOString(),
+      ],
+    );
+
+    const whileDeleted = await runMaintenanceSweep(engine, {
+      sourceId: 'default',
+      capabilities: KEYLESS,
+    });
+    expect(whileDeleted.linksRemoved).toBe(0);
+    expect(await engine.getLinks('notes/soft-writer', {
+      sourceId: 'default',
+    })).toHaveLength(1);
+
+    expect(await engine.restorePage('concepts/soft-target', {
+      sourceId: 'default',
+    })).toBe(true);
+    expect(await engine.getLinks('notes/soft-writer', {
+      sourceId: 'default',
+    })).toHaveLength(1);
+  });
+
+  test('a target deleted between managed read and delete keeps its recoverable edge', async () => {
+    await seedPage('concepts/soft-race-target', 'concept', 'Target page.');
+    await seedPage(
+      'notes/soft-race-writer',
+      'note',
+      'References [the target](concepts/soft-race-target).',
+    );
+    await runMaintenanceSweep(engine, {
+      sourceId: 'default',
+      capabilities: KEYLESS,
+    });
+    await engine.executeRaw(
+      `UPDATE pages
+          SET compiled_truth = 'The reference is gone.',
+              updated_at = $1
+        WHERE slug = 'notes/soft-race-writer' AND source_id = 'default'`,
+      [new Date(Date.now() + 1_000).toISOString()],
+    );
+
+    const ownTransaction = Object.getOwnPropertyDescriptor(engine, 'transaction');
+    const realTransaction = engine.transaction.bind(engine);
+    let injected = false;
+    Object.defineProperty(engine, 'transaction', {
+      configurable: true,
+      value: async (fn: (tx: BrainEngine) => Promise<unknown>) =>
+        realTransaction(async (tx) => {
+          const racingTx = new Proxy(tx as unknown as Record<string | symbol, unknown>, {
+            get(target, prop, receiver) {
+              const value = Reflect.get(target, prop, receiver);
+              if (prop === 'executeRaw' && typeof value === 'function') {
+                return async (sql: string, params?: unknown[]) => {
+                  if (!injected && sql.includes('DELETE FROM links')) {
+                    injected = true;
+                    await (value as (query: string, values?: unknown[]) => unknown).call(
+                      target,
+                      `UPDATE pages
+                          SET deleted_at = now()
+                        WHERE slug = 'concepts/soft-race-target'
+                          AND source_id = 'default'`,
+                    );
+                  }
+                  return (value as (query: string, values?: unknown[]) => unknown)
+                    .call(target, sql, params);
+                };
+              }
+              if (typeof value === 'function') {
+                return (...args: unknown[]) =>
+                  (value as (...a: unknown[]) => unknown).apply(target, args);
+              }
+              return value;
+            },
+          }) as unknown as BrainEngine;
+          return fn(racingTx);
+        }),
+    });
+
+    let report: SweepReport;
+    try {
+      report = await runMaintenanceSweep(engine, {
+        sourceId: 'default',
+        capabilities: KEYLESS,
+      });
+    } finally {
+      if (ownTransaction) Object.defineProperty(engine, 'transaction', ownTransaction);
+      else delete (engine as unknown as { transaction?: unknown }).transaction;
+    }
+
+    expect(injected).toBe(true);
+    expect(report!.linksRemoved).toBe(0);
+    const whileDeleted = await engine.executeRaw<{ n: string }>(
+      `SELECT COUNT(*) AS n
+         FROM links l
+         JOIN pages f ON f.id = l.from_page_id
+         JOIN pages t ON t.id = l.to_page_id
+        WHERE f.slug = 'notes/soft-race-writer'
+          AND f.source_id = 'default'
+          AND t.slug = 'concepts/soft-race-target'
+          AND t.source_id = 'default'`,
+    );
+    expect(parseInt(whileDeleted[0].n, 10)).toBe(1);
+    expect(await engine.restorePage('concepts/soft-race-target', {
+      sourceId: 'default',
+    })).toBe(true);
+    expect(await engine.getLinks('notes/soft-race-writer', {
+      sourceId: 'default',
+    })).toHaveLength(1);
+  });
+
+  test('repeated bounded sweeps advance past the first batch', async () => {
+    const now = Date.now();
+    await seedPage('concepts/batch-target', 'concept', 'Target page.');
+    await engine.executeRaw(
+      `UPDATE pages
+          SET updated_at = $1, links_extracted_at = $1
+        WHERE slug = 'concepts/batch-target' AND source_id = 'default'`,
+      [new Date(now - 10_000).toISOString()],
+    );
+
+    for (let i = 0; i < 3; i++) {
+      const slug = `notes/batch-writer-${i}`;
+      await seedPage(slug, 'note', 'References [the target](concepts/batch-target).');
+      await engine.executeRaw(
+        `UPDATE pages
+            SET updated_at = $1, links_extracted_at = NULL
+          WHERE slug = $2 AND source_id = 'default'`,
+        [new Date(now - (3 - i) * 1_000).toISOString(), slug],
+      );
+    }
+
+    await runMaintenanceSweep(engine, {
+      sourceId: 'default',
+      batchLimit: 2,
+      capabilities: KEYLESS,
+    });
+    const afterFirst = await engine.executeRaw<{ n: string }>(
+      `SELECT COUNT(*) AS n
+         FROM links l
+         JOIN pages pf ON pf.id = l.from_page_id
+         JOIN pages pt ON pt.id = l.to_page_id
+        WHERE pf.slug LIKE 'notes/batch-writer-%'
+          AND pt.slug = 'concepts/batch-target'`,
+    );
+    expect(parseInt(afterFirst[0].n, 10)).toBe(2);
+
+    await runMaintenanceSweep(engine, {
+      sourceId: 'default',
+      batchLimit: 2,
+      capabilities: KEYLESS,
+    });
+    const afterSecond = await engine.executeRaw<{ n: string }>(
+      `SELECT COUNT(*) AS n
+         FROM links l
+         JOIN pages pf ON pf.id = l.from_page_id
+         JOIN pages pt ON pt.id = l.to_page_id
+        WHERE pf.slug LIKE 'notes/batch-writer-%'
+          AND pt.slug = 'concepts/batch-target'`,
+    );
+    expect(parseInt(afterSecond[0].n, 10)).toBe(3);
+  });
+
+  test('a concurrent edit remains stale after the selected revision is stamped', async () => {
+    const selectedAt = new Date(Date.now() - 10_000).toISOString();
+    const editedAt = new Date(Date.now() - 5_000).toISOString();
+    await seedPage('concepts/race-target', 'concept', 'Target page.');
+    await seedPage(
+      'notes/race-writer',
+      'note',
+      'References [the target](concepts/race-target).',
+    );
+    await engine.executeRaw(
+      `UPDATE pages
+          SET updated_at = $1, links_extracted_at = NULL
+        WHERE slug = 'notes/race-writer' AND source_id = 'default'`,
+      [selectedAt],
+    );
+    await engine.executeRaw(
+      `UPDATE pages
+          SET updated_at = $1, links_extracted_at = $1
+        WHERE slug = 'concepts/race-target' AND source_id = 'default'`,
+      [new Date(Date.now() - 20_000).toISOString()],
+    );
+
+    let raced = false;
+    const racingEngine = new Proxy(engine as unknown as Record<string | symbol, unknown>, {
+      get(target, prop, receiver) {
+        const value = Reflect.get(target, prop, receiver);
+        if (prop === 'markPagesExtractedBatch' && typeof value === 'function') {
+          return async (...args: unknown[]) => {
+            if (!raced) {
+              raced = true;
+              await engine.executeRaw(
+                `UPDATE pages
+                    SET compiled_truth = 'The reference was concurrently removed.',
+                        updated_at = $1
+                  WHERE slug = 'notes/race-writer' AND source_id = 'default'`,
+                [editedAt],
+              );
+            }
+            return (value as (...a: unknown[]) => unknown).apply(target, args);
+          };
+        }
+        if (typeof value === 'function') {
+          return (...args: unknown[]) =>
+            (value as (...a: unknown[]) => unknown).apply(target, args);
+        }
+        return value;
+      },
+    }) as unknown as BrainEngine;
+
+    await runMaintenanceSweep(racingEngine, {
+      sourceId: 'default',
+      capabilities: KEYLESS,
+    });
+    const freshness = await engine.executeRaw<{ stale: boolean }>(
+      `SELECT updated_at > links_extracted_at AS stale
+         FROM pages
+        WHERE slug = 'notes/race-writer' AND source_id = 'default'`,
+    );
+    expect(raced).toBe(true);
+    expect(freshness[0].stale).toBe(true);
+
+    const retry = await runMaintenanceSweep(engine, {
+      sourceId: 'default',
+      capabilities: KEYLESS,
+    });
+    expect(retry.linksRemoved).toBe(1);
+    expect(await engine.getLinks('notes/race-writer', {
+      sourceId: 'default',
+    })).toHaveLength(0);
+  });
+
+  test('a disabled half prevents the shared extraction watermark from advancing', async () => {
+    await seedPage('concepts/gate-target', 'concept', 'Target page.');
+    await seedPage(
+      'notes/gate-writer',
+      'note',
+      'References [the target](concepts/gate-target).',
+    );
+    await engine.setConfig('auto_timeline', 'false');
+    try {
+      const linksOnly = await runMaintenanceSweep(engine, {
+        sourceId: 'default',
+        capabilities: KEYLESS,
+      });
+      expect(linksOnly.linksExtracted).toBe(1);
+      const unstamped = await engine.executeRaw<{ links_extracted_at: string | null }>(
+        `SELECT links_extracted_at
+           FROM pages
+          WHERE slug = 'notes/gate-writer' AND source_id = 'default'`,
+      );
+      expect(unstamped[0].links_extracted_at).toBeNull();
+    } finally {
+      await engine.setConfig('auto_timeline', 'true');
+    }
+
+    await runMaintenanceSweep(engine, {
+      sourceId: 'default',
+      capabilities: KEYLESS,
+    });
+    const stamped = await engine.executeRaw<{ links_extracted_at: string | null }>(
+      `SELECT links_extracted_at
+         FROM pages
+        WHERE slug = 'notes/gate-writer' AND source_id = 'default'`,
+    );
+    expect(stamped[0].links_extracted_at).not.toBeNull();
+  });
+
+  test('link-dense pages use one transaction-local batch without nested engine helpers', async () => {
+    const refs: string[] = [];
+    for (let i = 0; i < 40; i++) {
+      const slug = `concepts/dense-target-${i}`;
+      await seedPage(slug, 'concept', `Dense target ${i}.`);
+      refs.push(`[target ${i}](${slug})`);
+    }
+    await engine.executeRaw(
+      `UPDATE pages
+          SET links_extracted_at = updated_at
+        WHERE slug LIKE 'concepts/dense-target-%' AND source_id = 'default'`,
+    );
+    await seedPage('notes/dense-writer', 'note', refs.join('\n'));
+
+    const ownAddLink = Object.getOwnPropertyDescriptor(engine, 'addLink');
+    const ownAddLinksBatch = Object.getOwnPropertyDescriptor(engine, 'addLinksBatch');
+    const ownGetLinks = Object.getOwnPropertyDescriptor(engine, 'getLinks');
+    Object.defineProperty(engine, 'addLink', {
+      configurable: true,
+      value: async () => { throw new Error('per-edge addLink is forbidden in sweep'); },
+    });
+    Object.defineProperty(engine, 'getLinks', {
+      configurable: true,
+      value: async () => { throw new Error('nested getLinks is forbidden in sweep'); },
+    });
+    Object.defineProperty(engine, 'addLinksBatch', {
+      configurable: true,
+      value: async () => { throw new Error('self-retrying addLinksBatch is forbidden in a sweep transaction'); },
+    });
+    let report: SweepReport;
+    try {
+      report = await runMaintenanceSweep(engine, {
+        sourceId: 'default',
+        batchLimit: 1,
+        budgetMs: 30_000,
+        capabilities: KEYLESS,
+      });
+    } finally {
+      if (ownAddLink) Object.defineProperty(engine, 'addLink', ownAddLink);
+      else delete (engine as unknown as { addLink?: unknown }).addLink;
+      if (ownAddLinksBatch) Object.defineProperty(engine, 'addLinksBatch', ownAddLinksBatch);
+      else delete (engine as unknown as { addLinksBatch?: unknown }).addLinksBatch;
+      if (ownGetLinks) Object.defineProperty(engine, 'getLinks', ownGetLinks);
+      else delete (engine as unknown as { getLinks?: unknown }).getLinks;
+    }
+
+    expect(report!.skipped.map(item => item.reason)).not.toContain('links_timeline_error');
+    expect(report!.linksExtracted).toBe(40);
+    const rows = await engine.executeRaw<{ n: string }>(
+      `SELECT COUNT(*) AS n
+         FROM links l
+         JOIN pages p ON p.id = l.from_page_id
+        WHERE p.slug = 'notes/dense-writer' AND p.source_id = 'default'`,
+    );
+    expect(parseInt(rows[0].n, 10)).toBe(40);
+  });
+
+  test('a failed page rolls back locally without pinning healthy pages behind it', async () => {
+    await seedPage('concepts/rollback-target', 'concept', 'Target page.');
+    await engine.executeRaw(
+      `UPDATE pages
+          SET links_extracted_at = updated_at
+        WHERE slug = 'concepts/rollback-target' AND source_id = 'default'`,
+    );
+    await seedPage(
+      'notes/rollback-writer',
+      'note',
+      'References [the target](concepts/rollback-target).',
+    );
+    await seedPage(
+      'notes/rollback-healthy',
+      'note',
+      'References [the target](concepts/rollback-target).',
+    );
+    await engine.executeRaw(
+      `UPDATE pages
+          SET updated_at = CASE slug
+            WHEN 'notes/rollback-writer' THEN $1::timestamptz
+            ELSE $2::timestamptz
+          END
+        WHERE slug IN ('notes/rollback-writer', 'notes/rollback-healthy')
+          AND source_id = 'default'`,
+      [
+        new Date(Date.now() + 2_000).toISOString(),
+        new Date(Date.now() + 1_000).toISOString(),
+      ],
+    );
+
+    const ownTransaction = Object.getOwnPropertyDescriptor(engine, 'transaction');
+    const realTransaction = engine.transaction.bind(engine);
+    let injected = false;
+    Object.defineProperty(engine, 'transaction', {
+      configurable: true,
+      value: async (fn: (tx: BrainEngine) => Promise<unknown>) =>
+        realTransaction(async (tx) => {
+          const faultingTx = new Proxy(tx as unknown as Record<string | symbol, unknown>, {
+            get(target, prop, receiver) {
+              const value = Reflect.get(target, prop, receiver);
+              if (prop === 'executeRaw' && typeof value === 'function') {
+                return async (sql: string, params?: unknown[]) => {
+                  if (
+                    !injected &&
+                    sql.includes('FROM links l') &&
+                    params?.[0] === 'notes/rollback-writer'
+                  ) {
+                    injected = true;
+                    throw new Error('injected failure after transaction-local link insert');
+                  }
+                  return (value as (query: string, values?: unknown[]) => unknown)
+                    .call(target, sql, params);
+                };
+              }
+              if (typeof value === 'function') {
+                return (...args: unknown[]) =>
+                  (value as (...a: unknown[]) => unknown).apply(target, args);
+              }
+              return value;
+            },
+          }) as unknown as BrainEngine;
+          return fn(faultingTx);
+        }),
+    });
+
+    let report: SweepReport;
+    try {
+      report = await runMaintenanceSweep(engine, {
+        sourceId: 'default',
+        capabilities: KEYLESS,
+      });
+    } finally {
+      if (ownTransaction) Object.defineProperty(engine, 'transaction', ownTransaction);
+      else delete (engine as unknown as { transaction?: unknown }).transaction;
+    }
+
+    expect(injected).toBe(true);
+    expect(report!.skipped.map(item => item.reason)).toContain('link_reconcile_error');
+    expect(await engine.getLinks('notes/rollback-writer', {
+      sourceId: 'default',
+    })).toHaveLength(0);
+    expect(await engine.getLinks('notes/rollback-healthy', {
+      sourceId: 'default',
+    })).toHaveLength(1);
+    const watermarks = await engine.executeRaw<{
+      slug: string;
+      links_extracted_at: string | null;
+    }>(
+      `SELECT slug, links_extracted_at
+         FROM pages
+        WHERE slug IN ('notes/rollback-writer', 'notes/rollback-healthy')
+          AND source_id = 'default'
+        ORDER BY slug`,
+    );
+    expect(watermarks).toEqual([
+      { slug: 'notes/rollback-healthy', links_extracted_at: expect.anything() },
+      { slug: 'notes/rollback-writer', links_extracted_at: null },
+    ]);
+  });
+
+  test('a persistent page-load failure does not starve an older healthy page', async () => {
+    await seedPage('concepts/load-failure-target', 'concept', 'Target page.');
+    await engine.executeRaw(
+      `UPDATE pages
+          SET links_extracted_at = updated_at
+        WHERE slug = 'concepts/load-failure-target' AND source_id = 'default'`,
+    );
+    await seedPage(
+      'notes/load-failure-writer',
+      'note',
+      'References [the target](concepts/load-failure-target).',
+    );
+    await seedPage(
+      'notes/load-failure-healthy',
+      'note',
+      'References [the target](concepts/load-failure-target).',
+    );
+    await engine.executeRaw(
+      `UPDATE pages
+          SET updated_at = CASE slug
+            WHEN 'notes/load-failure-writer' THEN $1::timestamptz
+            ELSE $2::timestamptz
+          END
+        WHERE slug IN ('notes/load-failure-writer', 'notes/load-failure-healthy')
+          AND source_id = 'default'`,
+      [
+        new Date(Date.now() + 2_000).toISOString(),
+        new Date(Date.now() + 1_000).toISOString(),
+      ],
+    );
+
+    let failures = 0;
+    const newFaultingEngine = (): BrainEngine =>
+      new Proxy(engine as unknown as Record<string | symbol, unknown>, {
+        get(target, prop, receiver) {
+          const value = Reflect.get(target, prop, receiver);
+          if (prop === 'getPage' && typeof value === 'function') {
+            return async (slug: string, ...args: unknown[]) => {
+              if (slug === 'notes/load-failure-writer') {
+                failures++;
+                throw new Error('injected page-load failure');
+              }
+              return (value as (...a: unknown[]) => unknown).call(target, slug, ...args);
+            };
+          }
+          if (typeof value === 'function') {
+            return (...args: unknown[]) =>
+              (value as (...a: unknown[]) => unknown).apply(target, args);
+          }
+          return value;
+        },
+      }) as unknown as BrainEngine;
+
+    const reports = [];
+    for (let i = 0; i < 3; i++) {
+      reports.push(await runMaintenanceSweep(newFaultingEngine(), {
+        sourceId: 'default',
+        batchLimit: 1,
+        capabilities: KEYLESS,
+      }));
+    }
+
+    // The cursor retries the failed writer after completing the one-page
+    // healthy turn, rather than selecting it on every invocation.
+    expect(failures).toBe(2);
+    expect(reports.filter(report =>
+      report.skipped.some(item => item.reason === 'page_extraction_error'),
+    )).toHaveLength(2);
+    for (const report of reports) {
+      expect(report.skipped.map(item => item.reason)).not.toContain('links_timeline_error');
+    }
+    expect(await engine.getLinks('notes/load-failure-writer', {
+      sourceId: 'default',
+    })).toHaveLength(0);
+    expect(await engine.getLinks('notes/load-failure-healthy', {
+      sourceId: 'default',
+    })).toHaveLength(1);
+    const watermarks = await engine.executeRaw<{
+      slug: string;
+      links_extracted_at: string | null;
+    }>(
+      `SELECT slug, links_extracted_at
+         FROM pages
+        WHERE slug IN ('notes/load-failure-writer', 'notes/load-failure-healthy')
+          AND source_id = 'default'
+        ORDER BY slug`,
+    );
+    expect(watermarks).toEqual([
+      { slug: 'notes/load-failure-healthy', links_extracted_at: expect.anything() },
+      { slug: 'notes/load-failure-writer', links_extracted_at: null },
+    ]);
+  });
+
+  test('the durable cursor wraps newest-first instead of cycling mid-list pages', async () => {
+    const slugs = [
+      'notes/cursor-failure-newest',
+      'notes/cursor-failure-middle',
+      'notes/cursor-failure-oldest',
+    ];
+    for (const slug of slugs) await seedPage(slug, 'note', 'Unreachable during this test.');
+    await engine.executeRaw(
+      `UPDATE pages
+          SET updated_at = CASE slug
+            WHEN $1 THEN $4::timestamptz
+            WHEN $2 THEN $5::timestamptz
+            WHEN $3 THEN $6::timestamptz
+          END
+        WHERE slug IN ($1, $2, $3) AND source_id = 'default'`,
+      [
+        slugs[0], slugs[1], slugs[2],
+        new Date(Date.now() + 3_000).toISOString(),
+        new Date(Date.now() + 2_000).toISOString(),
+        new Date(Date.now() + 1_000).toISOString(),
+      ],
+    );
+
+    const attempted: string[] = [];
+    const newFaultingEngine = (): BrainEngine =>
+      new Proxy(engine as unknown as Record<string | symbol, unknown>, {
+        get(target, prop, receiver) {
+          const value = Reflect.get(target, prop, receiver);
+          if (prop === 'getPage' && typeof value === 'function') {
+            return async (slug: string, ...args: unknown[]) => {
+              if (slugs.includes(slug)) {
+                attempted.push(slug);
+                throw new Error('injected persistent page-load failure');
+              }
+              return (value as (...a: unknown[]) => unknown).call(target, slug, ...args);
+            };
+          }
+          if (typeof value === 'function') {
+            return (...args: unknown[]) =>
+              (value as (...a: unknown[]) => unknown).apply(target, args);
+          }
+          return value;
+        },
+      }) as unknown as BrainEngine;
+
+    for (let i = 0; i < 3; i++) {
+      await runMaintenanceSweep(newFaultingEngine(), {
+        sourceId: 'default',
+        batchLimit: 2,
+        capabilities: KEYLESS,
+      });
+    }
+
+    // A DESC wrap yields A,B then C,A then B,C. An ASC wrap would trap the
+    // cursor around B,C and never return to A after the initial batch.
+    expect(attempted).toEqual([
+      slugs[0], slugs[1],
+      slugs[2], slugs[0],
+      slugs[1], slugs[2],
+    ]);
+    const expectedCursor = await engine.executeRaw<{ id: number; updated_at_iso: string }>(
+      `SELECT id,
+              to_char(updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS updated_at_iso
+         FROM pages WHERE slug = $1 AND source_id = 'default'`,
+      [slugs[2]],
+    );
+    expect(JSON.parse(await engine.getConfig('sweep.links_timeline.cursor.v1.default') ?? '{}'))
+      .toEqual({ updatedAt: expectedCursor[0].updated_at_iso, id: expectedCursor[0].id });
   });
 
   test('auto_link/auto_timeline kill switches are honored', async () => {
@@ -473,6 +1201,79 @@ describe('runMaintenanceSweep — bounded link resolution (no listAllPageRefs)',
 });
 
 describe('runMaintenanceSweep — budget + never-throw', () => {
+  test('budget exhaustion between page transactions stops further reconciliation', async () => {
+    await seedPage('concepts/budget-target', 'concept', 'Target page.');
+    await engine.executeRaw(
+      `UPDATE pages
+          SET links_extracted_at = updated_at
+        WHERE slug = 'concepts/budget-target' AND source_id = 'default'`,
+    );
+    await seedPage(
+      'notes/budget-first',
+      'note',
+      'References [the target](concepts/budget-target).',
+    );
+    await seedPage(
+      'notes/budget-second',
+      'note',
+      'References [the target](concepts/budget-target).',
+    );
+    await engine.executeRaw(
+      `UPDATE pages
+          SET updated_at = CASE slug
+            WHEN 'notes/budget-first' THEN $1::timestamptz
+            ELSE $2::timestamptz
+          END
+        WHERE slug IN ('notes/budget-first', 'notes/budget-second')
+          AND source_id = 'default'`,
+      [
+        new Date(Date.now() + 2_000).toISOString(),
+        new Date(Date.now() + 1_000).toISOString(),
+      ],
+    );
+
+    const ownTransaction = Object.getOwnPropertyDescriptor(engine, 'transaction');
+    const realTransaction = engine.transaction.bind(engine);
+    let transactionCount = 0;
+    Object.defineProperty(engine, 'transaction', {
+      configurable: true,
+      value: async (fn: (tx: BrainEngine) => Promise<unknown>) => {
+        transactionCount += 1;
+        const result = await realTransaction(fn);
+        if (transactionCount === 1) {
+          await new Promise(resolve => setTimeout(resolve, 350));
+        }
+        return result;
+      },
+    });
+
+    let report: SweepReport;
+    try {
+      report = await runMaintenanceSweep(engine, {
+        sourceId: 'default',
+        budgetMs: 300,
+        capabilities: KEYLESS,
+      });
+    } finally {
+      if (ownTransaction) Object.defineProperty(engine, 'transaction', ownTransaction);
+      else delete (engine as unknown as { transaction?: unknown }).transaction;
+    }
+
+    expect(transactionCount).toBe(1);
+    expect(report!.linksExtracted).toBe(1);
+    expect(report!.skipped.map(item => item.reason)).toContain(
+      'budget_exhausted:links_timeline',
+    );
+    const linked = await engine.executeRaw<{ slug: string }>(
+      `SELECT f.slug
+         FROM links l
+         JOIN pages f ON f.id = l.from_page_id
+        WHERE f.slug LIKE 'notes/budget-%'
+        ORDER BY f.slug`,
+    );
+    expect(linked).toEqual([{ slug: 'notes/budget-first' }]);
+  });
+
   test('zero budget → every pass reports partial, nothing throws', async () => {
     await seedPage('people/budget-example', 'person', FENCE_BODY);
     const r = await runMaintenanceSweep(engine, {
@@ -512,6 +1313,7 @@ describe('runMaintenanceSweep — budget + never-throw', () => {
       corpusIngested: 0,
       factsReconciled: 3,
       linksExtracted: 1,
+      linksRemoved: 0,
       timelineExtracted: 0,
       skipped: [{ reason: 'budget_exhausted:corpus', count: 2 }],
       durationMs: 10,
@@ -802,6 +1604,7 @@ describe('runSweep CLI arg parsing [CX2-5]', () => {
     expect(r.verdict).toBe(0); // budget-skip is partial, NOT total failure
     expect(r.stdout.length).toBe(1); // exactly the JSON blob
     const report = JSON.parse(r.stdout[0]) as SweepReport;
+    expect(report.linksRemoved).toBe(0);
     const reasons = report.skipped.map((s) => s.reason).sort();
     expect(reasons).toEqual([
       'budget_exhausted:corpus',
@@ -817,6 +1620,7 @@ describe('runSweep CLI arg parsing [CX2-5]', () => {
     const out = r.stdout.join('\n');
     expect(out).toContain('Sweep complete');
     expect(out).toContain('source=my-src');
+    expect(out).toContain('links removed:');
     expect(out).toContain('budget_exhausted:facts_fence');
   });
 });
