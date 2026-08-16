@@ -49,6 +49,7 @@ import type { FactsBackstopCtx } from './facts/backstop.ts';
 import { detectCapabilities, type CapabilityReport } from './capability.ts';
 import { buildLinkRows } from './batch-rows.ts';
 import { executeRawJsonb } from './sql-query.ts';
+import { lookupLinkCandidateSources, resolveCandidateSources } from './link-source-resolution.ts';
 
 /** Delay before the serve-startup sweep fires (post-connect settle). */
 export const STARTUP_SWEEP_DELAY_MS = 3_000;
@@ -298,7 +299,7 @@ function parseLinksTimelineCursor(value: string | null): LinksTimelineCursor | n
  * Select at most one bounded batch, continuing after the prior page cursor.
  * The first seek walks older rows in the normal newest-first order. If it
  * reaches the end, the one allowed wrap query starts at the cursor itself so
- * an unstamped failed page is retried before newer rows can monopolise it.
+ * an unstamped failed page stays in bounded rotation with newer rows.
  */
 async function selectLinksTimelineCandidates(
   engine: BrainEngine,
@@ -306,6 +307,7 @@ async function selectLinksTimelineCandidates(
   cutoffIso: string,
   batchLimit: number,
   cursor: LinksTimelineCursor | null,
+  versionTs: string,
 ): Promise<Array<{ id: number; slug: string; updated_at_iso: string }>> {
   if (!cursor) {
     return engine.executeRaw<{ id: number; slug: string; updated_at_iso: string }>(
@@ -315,10 +317,12 @@ async function selectLinksTimelineCandidates(
         WHERE source_id = $1
           AND deleted_at IS NULL
           AND updated_at >= $2::timestamptz
-          AND (links_extracted_at IS NULL OR updated_at > links_extracted_at)
+          AND (links_extracted_at IS NULL
+            OR links_extracted_at < $3::timestamptz
+            OR updated_at > links_extracted_at)
         ORDER BY updated_at DESC, id DESC
-        LIMIT $3`,
-      [sourceId, cutoffIso, batchLimit],
+        LIMIT $4`,
+      [sourceId, cutoffIso, versionTs, batchLimit],
     );
   }
   const select = async (
@@ -333,11 +337,13 @@ async function selectLinksTimelineCandidates(
         WHERE source_id = $1
           AND deleted_at IS NULL
           AND updated_at >= $2::timestamptz
-          AND (links_extracted_at IS NULL OR updated_at > links_extracted_at)
+          AND (links_extracted_at IS NULL
+            OR links_extracted_at < $5::timestamptz
+            OR updated_at > links_extracted_at)
           AND ${predicate}
         ORDER BY updated_at ${order}, id ${order}
-        LIMIT $5`,
-      [sourceId, cutoffIso, cursor.updatedAt, cursor.id, limit],
+        LIMIT $6`,
+      [sourceId, cutoffIso, cursor.updatedAt, cursor.id, versionTs, limit],
     );
 
   const older = await select(
@@ -383,6 +389,7 @@ async function runLinksTimelinePass(
     isGlobalBasenameEnabled,
     isAutoLinkEnabled,
     isAutoTimelineEnabled,
+    LINK_EXTRACTOR_VERSION_TS,
   } = await import('./link-extraction.ts');
 
   // Respect the same operator kill switches put_page's inline hooks honor.
@@ -406,14 +413,9 @@ async function runLinksTimelinePass(
     );
   }
   const recent = await selectLinksTimelineCandidates(
-    engine, sourceId, cutoffIso, batchLimit, cursor,
+    engine, sourceId, cutoffIso, batchLimit, cursor, LINK_EXTRACTOR_VERSION_TS,
   );
   if (recent.length === 0) return;
-
-  // resolveCandidateSources is the shared helper the extract command exports
-  // precisely so sibling walkers cannot drift from its F10 multi-source
-  // resolution (see extract.ts:114).
-  const { resolveCandidateSources } = await import('../commands/extract.ts');
 
   const resolver = makeResolver(engine, { mode: 'batch', sourceId });
   const globalBasename = await isGlobalBasenameEnabled(engine);
@@ -479,10 +481,12 @@ async function runLinksTimelinePass(
       processedRefs.push({
         slug,
         source_id: sourceId,
-        // Stamp the exact full-microsecond value selected for this page. If a
-        // concurrent write advances updated_at after the SELECT, the older stamp
-        // leaves the page stale so a later sweep reconciles the newer content.
-        extractedAt: recent[i].updated_at_iso,
+        // Stamp the exact full-microsecond selected value, clamped to the
+        // extractor version. A concurrent write still advances updated_at past
+        // this value, leaving the page stale for a later reconciliation.
+        extractedAt: Date.parse(recent[i].updated_at_iso) >= Date.parse(LINK_EXTRACTOR_VERSION_TS)
+          ? recent[i].updated_at_iso
+          : LINK_EXTRACTOR_VERSION_TS,
       });
     } catch (e) {
       skip('page_extraction_error');
@@ -528,10 +532,10 @@ async function runLinksTimelinePass(
         if (c.fromSlug) needed.add(c.fromSlug);
       }
     }
-    const { allSlugs, slugToSources } = await lookupRefsForSlugs(engine, [...needed]);
+    const lookup = await lookupLinkCandidateSources(engine, needed);
     for (const { slug, candidates } of pageCandidates) {
       for (const c of candidates) {
-        const resolved = resolveCandidateSources(c, slug, sourceId, allSlugs, slugToSources);
+        const resolved = resolveCandidateSources(c, slug, sourceId, lookup);
         if (!resolved) continue;
         if (resolved.fromSlug !== slug || resolved.fromSourceId !== sourceId) {
           throw new Error(
@@ -650,7 +654,9 @@ async function reconcileSweepLinks(
                origin_source_id text, link_kind text
              )
              JOIN pages f
-               ON f.slug = v.from_slug AND f.source_id = v.from_source_id
+               ON f.slug = v.from_slug
+              AND f.source_id = v.from_source_id
+              AND f.deleted_at IS NULL
              JOIN pages t
                ON t.slug = v.to_slug AND t.source_id = v.to_source_id
              LEFT JOIN pages o
@@ -678,6 +684,7 @@ async function reconcileSweepLinks(
          JOIN pages t ON t.id = l.to_page_id
         WHERE f.slug = $1
           AND f.source_id = $2
+          AND f.deleted_at IS NULL
           AND l.link_source IN ('markdown', 'wikilink-resolved')
           AND l.origin_page_id IS NULL
           AND t.deleted_at IS NULL`,
@@ -694,8 +701,10 @@ async function reconcileSweepLinks(
     const removed = staleIds.length > 0
       ? (await tx.executeRaw<{ id: number }>(
           `DELETE FROM links l
-            USING pages t
+            USING pages f, pages t
            WHERE l.id = ANY($1::int[])
+             AND f.id = l.from_page_id
+             AND f.deleted_at IS NULL
              AND t.id = l.to_page_id
              AND t.deleted_at IS NULL
            RETURNING l.id AS id`,
@@ -705,36 +714,6 @@ async function reconcileSweepLinks(
 
     return { created, removed };
   });
-}
-
-/**
- * (slug, source_id) refs for EXACTLY the given slugs, chunked IN-list —
- * the bounded replacement for listAllPageRefs in the sweep's pass 2. Same
- * visibility as listAllPageRefs (deleted_at IS NULL).
- */
-async function lookupRefsForSlugs(
-  engine: BrainEngine,
-  slugs: string[],
-): Promise<{ allSlugs: Set<string>; slugToSources: Map<string, string[]> }> {
-  const allSlugs = new Set<string>();
-  const slugToSources = new Map<string, string[]>();
-  const CHUNK = 200;
-  for (let i = 0; i < slugs.length; i += CHUNK) {
-    const chunk = slugs.slice(i, i + CHUNK);
-    const placeholders = chunk.map((_, j) => `$${j + 1}`).join(', ');
-    const rows = await engine.executeRaw<{ slug: string; source_id: string }>(
-      `SELECT slug, source_id FROM pages
-        WHERE deleted_at IS NULL AND slug IN (${placeholders})`,
-      chunk,
-    );
-    for (const ref of rows) {
-      allSlugs.add(ref.slug);
-      const list = slugToSources.get(ref.slug) ?? [];
-      list.push(ref.source_id);
-      slugToSources.set(ref.slug, list);
-    }
-  }
-  return { allSlugs, slugToSources };
 }
 
 /**

@@ -99,6 +99,18 @@ describe('engine: stale-page extraction methods', () => {
     await engine.markPagesExtractedBatch([], new Date().toISOString());
     expect(true).toBe(true); // no throw
   });
+
+  test('markPagesExtractedBatch: soft-deleted rows remain unstamped for restore', async () => {
+    await engine.putPage('people/alice', personPage('Alice'));
+    expect(await engine.softDeletePage('people/alice')).not.toBeNull();
+    await engine.markPagesExtractedBatch(
+      [{ slug: 'people/alice', source_id: 'default' }],
+      '2099-01-01T00:00:00Z',
+    );
+    expect(await stampOf('people/alice')).toBeNull();
+    expect(await engine.restorePage('people/alice')).toBe(true);
+    expect(await engine.countStalePagesForExtraction()).toBe(1);
+  });
 });
 
 describe('gbrain extract --stale', () => {

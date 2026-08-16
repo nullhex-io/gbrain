@@ -21,20 +21,18 @@ import { assembleTurnContext } from '../core/context/turn-context.ts';
 import { gcSessionContextState } from '../core/context/session-state.ts';
 import { makeContextPackIpcHandler } from './context-pack-handler.ts';
 import { logTurnContextDeliveryFireAndForget } from '../core/context/volunteer-events.ts';
+import { ALL_SOURCES } from '../core/source-id.ts';
+import { loadAllSources } from '../core/sources-load.ts';
+import { allSourcesWriteFenceError } from '../core/ops/context.ts';
 
 export async function resolveMcpStdioSourceScope(
   engine: BrainEngine,
   cwd: string = process.cwd(),
 ): Promise<{ sourceId: string; localFederatedSourceIds?: string[]; tier: import('../core/source-resolver.ts').SourceTier }> {
+  let resolved: { source_id: string; tier: import('../core/source-resolver.ts').SourceTier };
   try {
-    const { resolveSourceWithTier, localFederatedSourceIds } = await import('../core/source-resolver.ts');
-    const resolved = await resolveSourceWithTier(engine, null, cwd);
-    const federated = await localFederatedSourceIds(engine, resolved.source_id, resolved.tier);
-    return {
-      sourceId: resolved.source_id,
-      ...(federated ? { localFederatedSourceIds: federated } : {}),
-      tier: resolved.tier,
-    };
+    const { resolveSourceWithTier } = await import('../core/source-resolver.ts');
+    resolved = await resolveSourceWithTier(engine, null, cwd);
   } catch {
     // Resolution failure. Report the tier truthfully so --source-guard makes
     // the safe call. A MALFORMED GBRAIN_SOURCE can never be a real binding —
@@ -50,6 +48,37 @@ export async function resolveMcpStdioSourceScope(
     return env && isValidSourceId(env)
       ? { sourceId: env, tier: 'env' }
       : { sourceId: 'default', tier: 'seed_default' };
+  }
+
+  try {
+    if (resolved.source_id === ALL_SOURCES) {
+      // GBRAIN_SOURCE=__all__ is an explicit trusted-operator capability, not
+      // a source binding. Issue every active source, including isolated ones.
+      // A per-call __all__ on ordinary grantless stdio remains limited to the
+      // transport-computed federated set in context.ts. On failure omit this
+      // capability so reads fail closed; dispatch still sees the sentinel and
+      // blocks every write/admin or mutating operation.
+      const activeSources = await loadAllSources(engine);
+      const localFederatedSourceIds = activeSources.map((source) => source.id);
+      return {
+        sourceId: resolved.source_id,
+        ...(localFederatedSourceIds.length > 0 ? { localFederatedSourceIds } : {}),
+        tier: resolved.tier,
+      };
+    }
+
+    const { localFederatedSourceIds } = await import('../core/source-resolver.ts');
+    const federated = await localFederatedSourceIds(engine, resolved.source_id, resolved.tier);
+    return {
+      sourceId: resolved.source_id,
+      ...(federated ? { localFederatedSourceIds: federated } : {}),
+      tier: resolved.tier,
+    };
+  } catch {
+    // Preserve a successfully resolved source. In particular, do not turn an
+    // ambient __all__ sentinel into 'default' if capability enumeration has a
+    // transient failure: that would re-open the write route below.
+    return { sourceId: resolved.source_id, tier: resolved.tier };
   }
 }
 
@@ -284,14 +313,17 @@ export async function handleToolCall(
   const op = operations.find(o => o.name === tool);
   if (!op) throw new Error(`Unknown tool: ${tool}`);
 
-  const validationError = validateParams(op, params);
-  if (validationError) throw new Error(validationError);
-
   const ctx = buildOperationContext(engine, params, {
     remote: false,
     logger: { info: console.log, warn: console.warn, error: console.error },
     ...(opts?.sourceId ? { sourceId: opts.sourceId } : {}),
   });
+
+  const allSourcesFence = allSourcesWriteFenceError(ctx.sourceId, op);
+  if (allSourcesFence) throw allSourcesFence;
+
+  const validationError = validateParams(op, params);
+  if (validationError) throw new Error(validationError);
 
   return op.handler(ctx, params);
 }

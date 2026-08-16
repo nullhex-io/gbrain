@@ -15,14 +15,12 @@ import {
   resolveSelfUpgradeMode,
   justUpgradedPath,
 } from './core/self-upgrade.ts';
-import { loadConfig, loadConfigFileOnly, loadConfigWithEngine, toEngineConfig, isThinClient } from './core/config.ts';
-import type { GBrainConfig } from './core/config.ts';
+import { loadConfig, loadConfigFileOnly, loadConfigWithEngine, toEngineConfig, isThinClient, type GBrainConfig } from './core/config.ts';
 import type { AIGatewayConfig } from './core/ai/types.ts';
 import type { BrainEngine } from './core/engine.ts';
-import { operations, OperationError } from './core/operations.ts';
+import { operations, OperationError, allSourcesWriteFenceError, type Operation, type OperationContext } from './core/operations.ts';
 import { resolveSourceIdEngineFree } from './core/source-resolver.ts';
 import { formatVolunteeredPage } from './core/context/volunteer.ts';
-import type { Operation, OperationContext } from './core/operations.ts';
 import { shouldForceExitAfterMain, finishCliTeardown, flushThenExit, currentExitCode, setCliExitVerdict } from './core/cli-force-exit.ts';
 import { serializeMarkdown } from './core/markdown.ts';
 import { parseGlobalFlags, setCliOptions, getCliOptions } from './core/cli-options.ts';
@@ -629,6 +627,8 @@ async function main() {
       throw e;
     }
 
+    const allSourcesFence = allSourcesWriteFenceError(ctx.sourceId, op);
+    if (allSourcesFence) throw allSourcesFence;
     let rawResult: unknown;
     if (op.scope === 'read') {
       try {
@@ -1117,16 +1117,9 @@ export async function readStdinBounded(): Promise<string | null> {
  * the server's grant scoping covers the rest) and maps the result onto the
  * op's `source_id` wire param.
  *
- * Ops that declare their OWN `source` param (facts add, etc.) are left
- * untouched — their --source is an op param, not scope. An explicit --source
- * on an op with no source_id wire param throws (loud beats silent drop);
- * ambient env/dotfile scope with nowhere to send it is ignored, matching the
- * pre-fix behavior for non-scopeable ops. Exported for tests.
+ * Own `source` params remain op parameters, but ambient scope is still fenced. Exported for tests.
  */
-// Ops whose `source_id` wire param is NOT read-scope semantics: get_skill's
-// source_id flips the lookup from host catalog to brain-resident-pack
-// (getResidentSkillDetail). Ambient env/dotfile scope must never leak into
-// these; an explicit --source-id still passes through untouched above.
+// get_skill's source_id flips host-catalog lookup to a brain-resident pack; ambient scope must not leak into it.
 const NON_SCOPE_SOURCE_ID_OPS = new Set(['get_skill']);
 
 export function applyThinClientSourceScope(
@@ -1134,7 +1127,11 @@ export function applyThinClientSourceScope(
   params: Record<string, unknown>,
   cwd?: string,
 ): void {
-  if ('source' in op.params) return; // the op owns --source; not a scope flag
+  if ('source' in op.params) {
+    const fence = allSourcesWriteFenceError(resolveSourceIdEngineFree(null, cwd) ?? undefined, op);
+    if (fence) throw fence;
+    return;
+  }
   const explicit = typeof params.source === 'string' && params.source.length > 0
     ? (params.source as string)
     : null;
@@ -1144,10 +1141,14 @@ export function applyThinClientSourceScope(
     if (explicit) {
       throw new Error('Pass either --source or --source-id/--all-sources, not both.');
     }
+    const fence = allSourcesWriteFenceError(params.source_id === '__all__' || params.all_sources === true ? '__all__' : undefined, op);
+    if (fence) throw fence;
     return;
   }
   const resolved = resolveSourceIdEngineFree(explicit, cwd);
   if (!resolved) return;
+  const allSourcesFence = allSourcesWriteFenceError(resolved, op);
+  if (allSourcesFence) throw allSourcesFence;
   if (!('source_id' in op.params) || NON_SCOPE_SOURCE_ID_OPS.has(op.name)) {
     if (explicit) {
       const hint = NON_SCOPE_SOURCE_ID_OPS.has(op.name)
@@ -1162,7 +1163,6 @@ export function applyThinClientSourceScope(
   params.source_id = resolved;
 }
 
-// Exported for tests (same import-safety contract as applyThinClientSourceScope).
 // ─────────────────────────────────────────────────────────────────
 // #2185 — strict unknown-flag validation (pre-dispatch, pre-engine).
 // A flag no handler consults must fail loud instead of silently doing the

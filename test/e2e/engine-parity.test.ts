@@ -780,6 +780,26 @@ describeBoth('Engine parity — Postgres vs PGLite', () => {
     }
     expect(await pgEngine.countStalePagesForExtraction({ sourceId: SRC })).toBe(2); // sp/1 (edited) + sp/3 (NULL)
     expect(await pgliteEngine.countStalePagesForExtraction({ sourceId: SRC })).toBe(2);
+
+    // Recovery invariant: a page soft-deleted after selection must not receive
+    // a freshness watermark, otherwise restoring it would suppress the retry.
+    for (const eng of [pgEngine, pgliteEngine]) {
+      expect(await eng.softDeletePage('sp/3', { sourceId: SRC })).not.toBeNull();
+      await eng.markPagesExtractedBatch(
+        [{ slug: 'sp/3', source_id: SRC }],
+        '2099-01-01T00:00:00Z',
+      );
+      const rows = await eng.executeRaw<{ n: string }>(
+        `SELECT COUNT(*) AS n
+           FROM pages
+          WHERE slug = 'sp/3'
+            AND source_id = $1
+            AND deleted_at IS NOT NULL
+            AND links_extracted_at IS NULL`,
+        [SRC],
+      );
+      expect(parseInt(rows[0].n, 10)).toBe(1);
+    }
   });
 
   // Chunkless-page safety net (embed --stale detection gap): a page with

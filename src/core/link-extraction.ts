@@ -447,6 +447,12 @@ export interface LinkCandidate {
   fromSlug?: string;
   /** Target page slug (no .md, no ../). */
   targetSlug: string;
+  /**
+   * Exact source requested by a qualified wikilink (`[[source:slug]]`).
+   * Omitted for unqualified references, which resolve local-first then
+   * default at the persistence boundary.
+   */
+  targetSourceId?: string;
   /** Inferred relationship type. */
   linkType: string;
   /** Surrounding text (up to ~80 chars) used for inference + storage. */
@@ -585,6 +591,7 @@ export async function extractPageLinks(
     const context = idx >= 0 ? excerpt(content, idx, 240) : ref.name;
     candidates.push({
       targetSlug: ref.slug,
+      ...(ref.sourceId ? { targetSourceId: ref.sourceId } : {}),
       linkType: inferLinkType(pageType, context, content, ref.slug),
       context,
       linkSource: 'markdown',
@@ -640,8 +647,8 @@ export async function extractPageLinks(
     fmUnresolved = fm.unresolved;
   }
 
-  // Within-page dedup: same (fromSlug, targetSlug, linkType, linkSource)
-  // collapses to one entry. First occurrence wins.
+  // Within-page dedup: same (fromSlug, target source+slug, linkType,
+  // linkSource) collapses to one entry. First occurrence wins.
   // Issue #972 (codex P2d, decided): a qualified `[[companies/acme]]` (typed
   // markdown edge) and a bare `[[acme]]` (wikilink-resolved edge) to the SAME
   // target are KEPT as separate rows — they carry different provenance
@@ -651,7 +658,7 @@ export async function extractPageLinks(
   const seen = new Set<string>();
   const result: LinkCandidate[] = [];
   for (const c of candidates) {
-    const key = `${c.fromSlug ?? ''}\u0000${c.targetSlug}\u0000${c.linkType}\u0000${c.linkSource ?? ''}`;
+    const key = `${c.fromSlug ?? ''}\u0000${c.targetSourceId ?? ''}\u0000${c.targetSlug}\u0000${c.linkType}\u0000${c.linkSource ?? ''}`;
     if (seen.has(key)) continue;
     seen.add(key);
     result.push(c);

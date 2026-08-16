@@ -12,6 +12,7 @@ import { describe, test, expect } from 'bun:test';
 import {
   resolveRequestedScope,
   resolveCodeIntelScope,
+  sourceScopeOpts,
   thinkSourceScopeOpts,
   OperationError,
   type OperationContext,
@@ -44,6 +45,17 @@ describe('resolveRequestedScope — __all__ / all_sources', () => {
   test('remote + __all__ with single-source grant scopes to that one source', () => {
     const ctx = ctxOf({ remote: true, sourceId: 'a', auth: { token: 't', clientId: 'c', scopes: [], allowedSources: ['a'] } as any });
     expect(resolveRequestedScope(ctx, '__all__')).toEqual({ sourceIds: ['a'] });
+  });
+
+  test('remote + __all__ with explicit empty grant retains the scalar floor, never an unscoped read', () => {
+    const ctx = ctxOf({ remote: true, sourceId: 'a', auth: { token: 't', clientId: 'c', scopes: [], allowedSources: [] } as any });
+    expect(resolveRequestedScope(ctx, '__all__')).toEqual({ sourceId: 'a' });
+  });
+
+  test('remote + __all__ with an empty grant and no scalar floor fails closed', () => {
+    const ctx = ctxOf({ remote: true, sourceId: undefined, auth: { token: 't', clientId: 'c', scopes: [], allowedSources: [] } as any });
+    expect(resolveRequestedScope(ctx, '__all__')).toEqual({ sourceId: '__all__' });
+    expect(sourceScopeOpts(ctx)).toEqual({ sourceId: '__all__' });
   });
 
   test('remote + __all__ with no federated grant falls back to scalar sourceId (never empty)', () => {
@@ -93,10 +105,33 @@ describe('resolveRequestedScope — explicit source_id', () => {
 
   test('remote with no federated grant array can pass an explicit source_id (scalar-floor model)', () => {
     // allowedSources undefined → no federated restriction to enforce; the scalar
-    // sourceId path governs. (Empty [] is treated the same as undefined.)
+    // sourceId path governs.
     expect(resolveRequestedScope(ctxOf({ remote: true }), 'z')).toEqual({ sourceId: 'z' });
-    const emptyGrant = ctxOf({ remote: true, auth: { token: 't', clientId: 'c', scopes: [], allowedSources: [] } as any });
-    expect(resolveRequestedScope(emptyGrant, 'z')).toEqual({ sourceId: 'z' });
+  });
+
+  test('remote + explicit source_id matching an explicitly empty OAuth grant scalar floor is allowed', () => {
+    const emptyGrant = ctxOf({ remote: true, sourceId: 'a', auth: { token: 't', clientId: 'c', scopes: [], allowedSources: [] } as any });
+    expect(resolveRequestedScope(emptyGrant, 'a')).toEqual({ sourceId: 'a' });
+  });
+
+  test('remote + explicit foreign source_id outside an explicitly empty OAuth grant is rejected', () => {
+    const emptyGrant = ctxOf({ remote: true, sourceId: 'a', auth: { token: 't', clientId: 'c', scopes: [], allowedSources: [] } as any });
+    expect(() => resolveRequestedScope(emptyGrant, 'b')).toThrow(OperationError);
+    try {
+      resolveRequestedScope(emptyGrant, 'b');
+    } catch (e) {
+      expect((e as OperationError).code).toBe('permission_denied');
+    }
+  });
+
+  test('remote + explicit source_id with an empty OAuth grant and no scalar floor is rejected', () => {
+    const emptyGrant = ctxOf({ remote: true, sourceId: undefined, auth: { token: 't', clientId: 'c', scopes: [], allowedSources: [] } as any });
+    expect(() => resolveRequestedScope(emptyGrant, 'a')).toThrow(OperationError);
+    try {
+      resolveRequestedScope(emptyGrant, 'a');
+    } catch (e) {
+      expect((e as OperationError).code).toBe('permission_denied');
+    }
   });
 });
 

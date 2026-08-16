@@ -63,6 +63,11 @@ import { createHash } from 'crypto';
 import { runSlidingPool } from '../core/worker-pool.ts';
 import { isAborted } from '../core/abort-check.ts';
 import { parseWorkers, resolveWorkersWithClamp } from '../core/sync-concurrency.ts';
+import {
+  resolveCandidateSources,
+} from '../core/link-source-resolution.ts';
+
+export { resolveCandidateSources } from '../core/link-source-resolution.ts';
 
 // Batch size for addLinksBatch / addTimelineEntriesBatch.
 // Postgres bind-parameter limit is 65535. Links use 4 cols/row → 16K hard ceiling;
@@ -113,31 +118,6 @@ export async function stampExtracted(
  * null when the candidate should be skipped. Shared by extractLinksFromDB and
  * extractStaleFromDB so the F10 multi-source resolution can't drift.
  */
-export function resolveCandidateSources(
-  c: LinkCandidate,
-  pageSlug: string,
-  pageSourceId: string,
-  allSlugs: Set<string>,
-  slugToSources: Map<string, string[]>,
-): { fromSlug: string; fromSourceId: string; toSourceId: string } | null {
-  const fromSlug = c.fromSlug ?? pageSlug;
-  if (!allSlugs.has(c.targetSlug)) return null;
-  if (!allSlugs.has(fromSlug)) return null;
-  const fromSources = slugToSources.get(fromSlug) ?? [];
-  const fromSourceId = fromSources.includes(pageSourceId) ? pageSourceId
-    : (fromSources.includes('default') ? 'default' : fromSources[0]);
-  const targetSources = slugToSources.get(c.targetSlug) ?? [];
-  let toSourceId: string;
-  if (targetSources.includes(fromSourceId)) {
-    toSourceId = fromSourceId;
-  } else if (targetSources.includes('default')) {
-    toSourceId = 'default';
-  } else {
-    return null;
-  }
-  return { fromSlug, fromSourceId, toSourceId };
-}
-
 // isRetryableConnError reference retained for any inline classification at
 // call sites. Engine-level retry uses the same predicate via core/retry.ts.
 void isRetryableConnError;
@@ -1576,7 +1556,7 @@ async function extractLinksFromDB(
       // helper in v0.42.7 (#1696) so extract --stale reuses the exact same
       // endpoint-validation + from/to source-id picking (null = skip: missing
       // endpoint OR target only in a non-origin/non-default source).
-      const resolved = resolveCandidateSources(c, slug, source_id, allSlugs, slugToSources);
+      const resolved = resolveCandidateSources(c, slug, source_id, { allSlugs, slugToSources });
       if (!resolved) { skippedMissingTarget++; continue; }
       const { fromSlug, fromSourceId, toSourceId } = resolved;
 
@@ -1856,7 +1836,7 @@ export async function extractStaleFromDB(
         { skipFrontmatter: !includeFrontmatter, globalBasename },
       );
       for (const c of extracted.candidates) {
-        const r = resolveCandidateSources(c, page.slug, page.source_id, allSlugs, slugToSources);
+        const r = resolveCandidateSources(c, page.slug, page.source_id, { allSlugs, slugToSources });
         if (!r) { skippedMissingTarget++; continue; }
         linkRows.push({
           from_slug: r.fromSlug, to_slug: c.targetSlug, link_type: c.linkType,

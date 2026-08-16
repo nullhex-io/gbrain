@@ -44,8 +44,8 @@ export {
   federatedSearchScope,
   resolveCodeIntelScope,
   resolvePerCallMode,
+  allSourcesWriteFenceError,
 } from './ops/context.ts';
-
 // --- Tranche 1 (pure move, v0.46.x): the Page CRUD, Search (search/query),
 // Takes+think, Tags, Links+graph, and Timeline op clusters live in
 // ops/pages.ts, ops/search.ts, ops/takes.ts, ops/tags.ts, ops/links.ts, and

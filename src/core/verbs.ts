@@ -185,6 +185,7 @@ const entity: Operation = {
   annotations: { title: 'entity (card lookup, zero LLM)', readOnlyHint: true },
   handler: async (ctx, p) => {
     const { verbError } = await import('./operations.ts');
+    const { singleSourceReadId } = await import('./ops/context.ts');
     const name = typeof p.name === 'string' ? p.name.trim() : '';
     if (!name) {
       throw verbError(
@@ -195,7 +196,7 @@ const entity: Operation = {
     }
     const t0 = Date.now();
     const { buildEntityCard } = await import('./verbs/entity-card.ts');
-    const result = await buildEntityCard(ctx.engine, ctx.sourceId ?? 'default', name, {
+    const result = await buildEntityCard(ctx.engine, singleSourceReadId(ctx, 'entity'), name, {
       remote: ctx.remote !== false,
     });
     return {

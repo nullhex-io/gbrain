@@ -20,6 +20,18 @@ function makeEngine(registeredSources: string[]): BrainEngine {
       if (sql.includes('SELECT id, config, archived FROM sources')) {
         return registeredSources.map(id => ({ id, config: null, archived: false }) as T);
       }
+      if (sql.includes('SELECT id, name, local_path, last_commit, last_sync_at, config, created_at')) {
+        return registeredSources.map(id => ({
+          id,
+          name: id,
+          local_path: null,
+          last_commit: null,
+          last_sync_at: null,
+          config: id === 'default' || id === 'team-alpha' ? { federated: true } : {},
+          created_at: new Date(),
+          archived: false,
+        }) as T);
+      }
       return [];
     },
     getConfig: async () => null,
@@ -68,6 +80,21 @@ describe('stdio MCP source resolution', () => {
       );
 
       expect(scope).toEqual({ sourceId: 'env-source', tier: 'env' });
+    });
+  });
+
+  test('GBRAIN_SOURCE=__all__ issues every active source, including isolated ones', async () => {
+    await withEnv({ GBRAIN_SOURCE: '__all__' }, async () => {
+      const scope = await resolveMcpStdioSourceScope(
+        makeEngine(['default', 'team-alpha', 'private']),
+        '/nonexistent',
+      );
+
+      expect(scope).toEqual({
+        sourceId: '__all__',
+        localFederatedSourceIds: ['default', 'team-alpha', 'private'],
+        tier: 'env',
+      });
     });
   });
 });

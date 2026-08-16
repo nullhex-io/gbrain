@@ -3309,7 +3309,7 @@ export class PGLiteEngine implements BrainEngine {
     await this.db.query(
       `UPDATE pages p SET links_extracted_at = v.ts::timestamptz
          FROM unnest($1::text[], $2::text[], $3::text[]) AS v(slug, source_id, ts)
-         WHERE p.slug = v.slug AND p.source_id = v.source_id`,
+         WHERE p.slug = v.slug AND p.source_id = v.source_id AND p.deleted_at IS NULL`,
       [slugs, srcs, tss],
     );
   }
@@ -3396,46 +3396,42 @@ export class PGLiteEngine implements BrainEngine {
     from: string,
     to: string,
     linkType?: string,
-    linkSource?: string,
-    opts?: { fromSourceId?: string; toSourceId?: string },
+    linkSource?: string | null,
+    opts?: {
+      fromSourceId?: string;
+      toSourceId?: string;
+      originSlug?: string | null;
+      originSourceId?: string;
+    },
   ): Promise<void> {
     const fromSrc = opts?.fromSourceId ?? 'default';
     const toSrc = opts?.toSourceId ?? 'default';
-    // Each branch source-qualifies page-id subqueries so a delete only targets
-    // the intended edge between per-source slug rows.
-    if (linkType !== undefined && linkSource !== undefined) {
-      await this.db.query(
-        `DELETE FROM links
-         WHERE from_page_id = (SELECT id FROM pages WHERE slug = $1 AND source_id = $2)
-           AND to_page_id = (SELECT id FROM pages WHERE slug = $3 AND source_id = $4)
-           AND link_type = $5
-           AND link_source IS NOT DISTINCT FROM $6`,
-        [from, fromSrc, to, toSrc, linkType, linkSource]
-      );
-    } else if (linkType !== undefined) {
-      await this.db.query(
-        `DELETE FROM links
-         WHERE from_page_id = (SELECT id FROM pages WHERE slug = $1 AND source_id = $2)
-           AND to_page_id = (SELECT id FROM pages WHERE slug = $3 AND source_id = $4)
-           AND link_type = $5`,
-        [from, fromSrc, to, toSrc, linkType]
-      );
-    } else if (linkSource !== undefined) {
-      await this.db.query(
-        `DELETE FROM links
-         WHERE from_page_id = (SELECT id FROM pages WHERE slug = $1 AND source_id = $2)
-           AND to_page_id = (SELECT id FROM pages WHERE slug = $3 AND source_id = $4)
-           AND link_source IS NOT DISTINCT FROM $5`,
-        [from, fromSrc, to, toSrc, linkSource]
-      );
-    } else {
-      await this.db.query(
-        `DELETE FROM links
-         WHERE from_page_id = (SELECT id FROM pages WHERE slug = $1 AND source_id = $2)
-           AND to_page_id = (SELECT id FROM pages WHERE slug = $3 AND source_id = $4)`,
-        [from, fromSrc, to, toSrc]
-      );
+    // Omitted originSlug preserves removeLink's historical broad-delete API.
+    // When supplied, match the origin component of the links unique key too.
+    const params: Array<string | null> = [from, fromSrc, to, toSrc];
+    const where = [
+      'from_page_id = (SELECT id FROM pages WHERE slug = $1 AND source_id = $2)',
+      'to_page_id = (SELECT id FROM pages WHERE slug = $3 AND source_id = $4)',
+    ];
+    if (linkType !== undefined) {
+      params.push(linkType);
+      where.push(`link_type = $${params.length}`);
     }
+    if (linkSource !== undefined) {
+      params.push(linkSource);
+      where.push(`link_source IS NOT DISTINCT FROM $${params.length}`);
+    }
+    if (opts?.originSlug !== undefined) {
+      if (opts.originSlug === null) {
+        where.push('origin_page_id IS NULL');
+      } else {
+        params.push(opts.originSlug, opts.originSourceId ?? 'default');
+        where.push(
+          `origin_page_id = (SELECT id FROM pages WHERE slug = $${params.length - 1} AND source_id = $${params.length})`,
+        );
+      }
+    }
+    await this.db.query(`DELETE FROM links WHERE ${where.join('\n  AND ')}`, params);
   }
 
   async getLinks(slug: string, opts?: { sourceId?: string; sourceIds?: string[] }): Promise<Link[]> {

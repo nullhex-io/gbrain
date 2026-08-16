@@ -18,7 +18,7 @@ import { describe, test, expect, afterEach, beforeEach } from 'bun:test';
 import { dispatchToolCall } from '../src/mcp/dispatch.ts';
 import { operations } from '../src/core/operations.ts';
 import { sourceGuardBlocksWrite, WRITE_SAFE_SOURCE_TIERS, __resetSourceGuardQueryShape, type SourceTier } from '../src/core/source-resolver.ts';
-import { resolveMcpStdioSourceScope } from '../src/mcp/server.ts';
+import { handleToolCall, resolveMcpStdioSourceScope } from '../src/mcp/server.ts';
 import type { BrainEngine } from '../src/core/engine.ts';
 
 function engineWithSources(ids: string[]): BrainEngine {
@@ -186,6 +186,17 @@ describe('dispatch gate', () => {
     expect(parsed(result).message).toContain('__all__');
   });
 
+  test('__all__ sentinel blocks write, admin, and read-scoped mutating operations without --source-guard', async () => {
+    for (const opName of [A_WRITE_OP, 'submit_job', 'think', 'request_tools', 'delta']) {
+      const result = await dispatchToolCall(multiSource, opName, {}, {
+        remote: true, transport: 'stdio', sourceId: '__all__',
+      });
+      expect(result.isError).toBe(true);
+      expect(parsed(result).error).toBe('source_binding_required');
+      expect(parsed(result).message).toContain('__all__');
+    }
+  });
+
   test('guard off (no sourceGuardTier) never blocks — regression pin', async () => {
     const result = await dispatchToolCall(multiSource, A_WRITE_OP, {}, {
       remote: true, transport: 'stdio', sourceId: 'default',
@@ -215,5 +226,24 @@ describe('resolveMcpStdioSourceScope tier passthrough', () => {
     const scope = await resolveMcpStdioSourceScope(throwingEngine, '/nonexistent/plugin-snapshot');
     expect(scope.sourceId).toBe('wiki');
     expect(scope.tier).toBe('env');
+  });
+
+  test('GBRAIN_SOURCE=__all__ survives capability enumeration failure fail-closed', async () => {
+    process.env.GBRAIN_SOURCE = '__all__';
+    const scope = await resolveMcpStdioSourceScope(throwingEngine, '/nonexistent/plugin-snapshot');
+    expect(scope).toEqual({ sourceId: '__all__', tier: 'env' });
+  });
+});
+
+describe('trusted gbrain call dispatch', () => {
+  test('handleToolCall fences write/admin while allowing read operations', async () => {
+    const engine = engineWithSources(['default', 'wiki']);
+    for (const opName of ['put_page', 'submit_job']) {
+      await expect(handleToolCall(engine, opName, {}, { sourceId: '__all__' }))
+        .rejects.toMatchObject({ code: 'source_binding_required' });
+    }
+
+    await expect(handleToolCall(engine, 'whoami', {}, { sourceId: '__all__' }))
+      .resolves.toEqual({ transport: 'local', scopes: [] });
   });
 });

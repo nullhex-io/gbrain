@@ -140,3 +140,70 @@ describe('applyThinClientSourceScope (#2098)', () => {
     });
   });
 });
+
+describe('thin-client __all__ write fence', () => {
+  const putPageOp = operationsByName.put_page;
+  const deletePageOp = operationsByName.delete_page;
+  const addTimelineEntryOp = operationsByName.add_timeline_entry;
+
+  test('ambient __all__ cannot route put_page or delete_page remotely', async () => {
+    await withEnv({ GBRAIN_SOURCE: '__all__' }, () => {
+      const putParams: Record<string, unknown> = { slug: 'notes/example', content: 'body' };
+      const deleteParams: Record<string, unknown> = { slug: 'notes/example' };
+
+      // Previously #2098 left this unchanged because neither operation has a
+      // source_id wire param. It must now fail before any remote request.
+      expect(() => applyThinClientSourceScope(putPageOp, putParams, '/'))
+        .toThrow(/read-span sentinel/);
+      expect(() => applyThinClientSourceScope(deletePageOp, deleteParams, '/'))
+        .toThrow(/read-span sentinel/);
+      expect(() => applyThinClientSourceScope(
+        addTimelineEntryOp,
+        { slug: 'notes/example', date: '2026-08-16', text: 'event', source: 'calendar' },
+        '/',
+      )).toThrow(/read-span sentinel/);
+    });
+  });
+
+  test('explicit CLI all-source requests cannot bypass the fence', async () => {
+    await withEnv({ GBRAIN_SOURCE: undefined }, () => {
+      expect(() => applyThinClientSourceScope(
+        putPageOp,
+        { slug: 'notes/example', content: 'body', source: '__all__' },
+        '/',
+      )).toThrow(/read-span sentinel/);
+    });
+  });
+
+  test('explicit wire all-source requests cannot bypass the fence', () => {
+    expect(() => applyThinClientSourceScope(
+      putPageOp,
+      { slug: 'notes/example', content: 'body', source_id: '__all__' },
+      '/',
+    )).toThrow(/read-span sentinel/);
+    expect(() => applyThinClientSourceScope(
+      putPageOp,
+      { slug: 'notes/example', content: 'body', all_sources: true },
+      '/',
+    )).toThrow(/read-span sentinel/);
+  });
+
+  test('ordinary reads and concrete source selection remain allowed', async () => {
+    const explicitWireRead: Record<string, unknown> = { query: 'find things', source_id: '__all__' };
+    expect(() => applyThinClientSourceScope(queryOp, explicitWireRead, '/')).not.toThrow();
+
+    await withEnv({ GBRAIN_SOURCE: '__all__' }, () => {
+      const params: Record<string, unknown> = { query: 'find things' };
+      expect(() => applyThinClientSourceScope(queryOp, params, '/')).not.toThrow();
+      expect(params.source_id).toBe('__all__');
+    });
+
+    await withEnv({ GBRAIN_SOURCE: 'wiki' }, () => {
+      expect(() => applyThinClientSourceScope(
+        putPageOp,
+        { slug: 'notes/example', content: 'body' },
+        '/',
+      )).not.toThrow();
+    });
+  });
+});

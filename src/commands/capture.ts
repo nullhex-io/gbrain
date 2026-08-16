@@ -36,7 +36,7 @@ import type { BrainEngine } from '../core/engine.ts';
 import { loadConfig, isThinClient } from '../core/config.ts';
 import { callRemoteTool, unpackToolResult, RemoteMcpError } from '../core/mcp-client.ts';
 import { computeContentHash } from '../core/ingestion/types.ts';
-import { operations } from '../core/operations.ts';
+import { operations, allSourcesWriteFenceError } from '../core/operations.ts';
 import type { OperationContext } from '../core/operations.ts';
 import { resolveSourceWithTier } from '../core/source-resolver.ts';
 
@@ -576,6 +576,12 @@ export async function runCapture(engine: BrainEngine | null, args: string[]): Pr
     // from every other CLI op's behavior).
     sourceId: resolvedSourceId,
   };
+  const allSourcesFence = allSourcesWriteFenceError(ctx.sourceId, putPageOp);
+  if (allSourcesFence) {
+    console.error(`gbrain capture [${allSourcesFence.code}]: ${allSourcesFence.message}`);
+    if (allSourcesFence.suggestion) console.error(`  Fix: ${allSourcesFence.suggestion}`);
+    process.exit(1);
+  }
   try {
     // v0.39.3.0 WARN-8: pass provenance params to put_page. CV3 source_kind
     // is always 'capture-cli'; ingested_via is 'put_page' (the write API),

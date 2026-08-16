@@ -21,10 +21,13 @@ import {
   resolveSourceWithTier,
 } from '../src/core/source-resolver.ts';
 import {
+  operations,
+  OperationError,
   sourceScopeOpts,
   federatedSearchScope,
   type OperationContext,
 } from '../src/core/operations.ts';
+import { singleSourceReadId } from '../src/core/ops/context.ts';
 import type { BrainEngine } from '../src/core/engine.ts';
 
 // Stub engine: registered sources + no local_path rows + no default config.
@@ -116,6 +119,16 @@ describe('sourceScopeOpts — __all__ sentinel', () => {
     expect(sourceScopeOpts(ctx)).toEqual({ sourceId: '__all__' });
   });
 
+  test('an empty transport-issued capability retains the literal and never widens', () => {
+    const ctx = ctxOf({
+      remote: true,
+      sourceId: '__all__',
+      localFederatedSourceIds: [],
+    });
+    expect(sourceScopeOpts(ctx)).toEqual({ sourceId: '__all__' });
+    expect(federatedSearchScope(ctx, '__all__')).toEqual({ sourceId: '__all__' });
+  });
+
   test('a federated grant always wins over the sentinel', () => {
     const ctx = ctxOf({
       remote: true,
@@ -123,6 +136,36 @@ describe('sourceScopeOpts — __all__ sentinel', () => {
       auth: { token: 't', clientId: 'c', scopes: [], allowedSources: ['a', 'b'] } as any,
     });
     expect(sourceScopeOpts(ctx)).toEqual({ sourceIds: ['a', 'b'] });
+  });
+});
+
+describe('scalar reads - ambient __all__', () => {
+  const ambient = ctxOf({
+    sourceId: '__all__',
+    localFederatedSourceIds: ['default', 'team'],
+  });
+
+  test('requires one issued source instead of the old entity false-miss scope', async () => {
+    const entity = operations.find((op) => op.name === 'entity')!;
+    await expect(entity.handler(ambient, { name: 'Alice' })).rejects.toMatchObject({
+      name: 'OperationError', code: 'source_binding_required',
+    });
+  });
+
+  test('recall, context_pack, and delta reject multi-source scalar reads before engine access', async () => {
+    for (const [name, params] of [
+      ['recall', {}],
+      ['context_pack', { entities: 'Alice' }],
+      ['delta', { since: '2026-01-01T00:00:00Z' }],
+    ] as const) {
+      const op = operations.find((candidate) => candidate.name === name)!;
+      await expect(op.handler(ambient, params)).rejects.toBeInstanceOf(OperationError);
+    }
+  });
+
+  test('uses exactly one server-issued source and preserves concrete reads', () => {
+    expect(singleSourceReadId(ctxOf({ sourceId: '__all__', localFederatedSourceIds: ['team'] }), 'entity')).toBe('team');
+    expect(singleSourceReadId(ctxOf({ sourceId: 'team' }), 'entity')).toBe('team');
   });
 });
 
@@ -142,6 +185,56 @@ describe('__all__ is never narrower than an unqualified read', () => {
     // …and __all__ must be a superset of that: the whole brain ({}).
     const all = ctxOf({ remote: false, sourceId: '__all__' });
     expect(federatedSearchScope(all)).toEqual({});
+  });
+
+  test('grantless stdio keeps an isolated source out of explicit __all__', () => {
+    // The ordinary stdio capability is transport-computed federation, not the
+    // ambient GBRAIN_SOURCE=__all__ operator capability. `isolated` is absent.
+    const ctx = ctxOf({
+      remote: true,
+      sourceId: 'default',
+      localFederatedSourceIds: ['default', 'src-a', 'src-b'],
+    });
+
+    expect(federatedSearchScope(ctx)).toEqual({
+      sourceIds: ['default', 'src-a', 'src-b'],
+    });
+    expect(federatedSearchScope(ctx, '__all__')).toEqual({
+      sourceIds: ['default', 'src-a', 'src-b'],
+    });
+    expect(federatedSearchScope(ctx, '__all__').sourceIds).not.toContain('isolated');
+    expect(federatedSearchScope(ctx, 'src-a')).toEqual({ sourceId: 'src-a' });
+  });
+
+  test('ambient sentinel honors every source in its server-issued capability', () => {
+    const ctx = ctxOf({
+      remote: true,
+      sourceId: '__all__',
+      localFederatedSourceIds: ['default', 'src-a'],
+    });
+    expect(sourceScopeOpts(ctx)).toEqual({ sourceIds: ['default', 'src-a'] });
+    expect(federatedSearchScope(ctx)).toEqual({ sourceIds: ['default', 'src-a'] });
+  });
+
+  test('OAuth grants, including an empty grant, remain authoritative', () => {
+    const localFederatedSourceIds = ['default', 'src-a', 'src-b'];
+    const granted = ctxOf({
+      remote: true,
+      sourceId: 'default',
+      localFederatedSourceIds,
+      auth: { token: 't', clientId: 'c', scopes: [], allowedSources: ['tenant-a', 'tenant-b'] } as any,
+    });
+    expect(federatedSearchScope(granted, '__all__')).toEqual({
+      sourceIds: ['tenant-a', 'tenant-b'],
+    });
+
+    const emptyGrant = ctxOf({
+      remote: true,
+      sourceId: 'default',
+      localFederatedSourceIds,
+      auth: { token: 't', clientId: 'c', scopes: [], allowedSources: [] } as any,
+    });
+    expect(federatedSearchScope(emptyGrant, '__all__')).toEqual({ sourceId: 'default' });
   });
 });
 
@@ -170,7 +263,9 @@ describe('cli makeContext — no silent default fallback for explicit --source',
       executeRaw: async () => { throw new Error('relation "sources" does not exist'); },
       getConfig: async () => { throw new Error('relation "config" does not exist'); },
     } as unknown as BrainEngine;
-    const ctx = await makeContext(broken, {});
-    expect(ctx.sourceId).toBe('default');
+    await withEnv({ GBRAIN_SOURCE: undefined }, async () => {
+      const ctx = await makeContext(broken, {});
+      expect(ctx.sourceId).toBe('default');
+    });
   });
 });

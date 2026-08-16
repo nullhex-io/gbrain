@@ -26,6 +26,7 @@ import { _resetStdoutRedirectForTests } from '../src/core/console-prefix.ts';
 import type { CapabilityReport } from '../src/core/capability.ts';
 import { __setChatTransportForTests, type ChatResult } from '../src/core/ai/gateway.ts';
 import { runServe, type ServeOptions } from '../src/commands/serve.ts';
+import { LINK_EXTRACTOR_VERSION_TS } from '../src/core/link-extraction.ts';
 
 const KEYLESS: CapabilityReport = {
   embeddings: { available: false },
@@ -149,6 +150,31 @@ describe('runMaintenanceSweep — facts-fence reconciliation [CX2-4]', () => {
 });
 
 describe('runMaintenanceSweep — link/timeline extraction [CX-P0.3]', () => {
+  test('re-extracts and clears pages stale only by extractor version', async () => {
+    await seedPage('notes/version-stale-writer', 'note', 'No links.');
+    await engine.executeRaw(
+      `UPDATE pages
+          SET updated_at = '2026-07-30T00:00:00Z'::timestamptz,
+              links_extracted_at = '2026-07-31T00:00:00Z'::timestamptz
+        WHERE slug = 'notes/version-stale-writer' AND source_id = 'default'`,
+    );
+
+    await runMaintenanceSweep(engine, {
+      sourceId: 'default',
+      capabilities: KEYLESS,
+      recentDays: 36_500,
+    });
+
+    const rows = await engine.executeRaw<{ extracted_at: string }>(
+      `SELECT to_char(links_extracted_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS extracted_at
+         FROM pages
+        WHERE slug = 'notes/version-stale-writer' AND source_id = 'default'`,
+    );
+    expect(Date.parse(rows[0].extracted_at)).toBeGreaterThanOrEqual(
+      Date.parse(LINK_EXTRACTOR_VERSION_TS),
+    );
+  });
+
   test('markdown ref + timeline line produce rows via the real extractors', async () => {
     await seedPage('people/alice-example', 'person', 'Alice Example founder profile.');
     await seedPage(
@@ -189,7 +215,7 @@ describe('runMaintenanceSweep — link/timeline extraction [CX-P0.3]', () => {
     expect(parseInt(tl[0].n, 10)).toBe(1);
   });
 
-  test('removed markdown refs are pruned while manual edges survive', async () => {
+  test('removed managed refs are pruned while unmanaged provenances survive', async () => {
     await seedPage('concepts/sweep-target', 'concept', 'Target page.');
     await seedPage(
       'notes/sweep-writer',
@@ -210,6 +236,39 @@ describe('runMaintenanceSweep — link/timeline extraction [CX-P0.3]', () => {
       'mentions',
       'manual',
     );
+    await engine.addLink(
+      'notes/sweep-writer',
+      'concepts/sweep-target',
+      'Frontmatter-owned edge',
+      'mentions',
+      'frontmatter',
+      'notes/sweep-writer',
+      'related',
+    );
+    await engine.addLink(
+      'notes/sweep-writer',
+      'concepts/sweep-target',
+      'External deriver edge',
+      'mentions',
+      'citation-graph',
+    );
+    await engine.executeRaw(
+      `INSERT INTO links (from_page_id, to_page_id, link_type, context, link_source)
+       SELECT f.id, t.id, 'mentions', 'Legacy edge', NULL
+         FROM pages f
+         JOIN pages t ON true
+        WHERE f.slug = 'notes/sweep-writer'
+          AND f.source_id = 'default'
+          AND t.slug = 'concepts/sweep-target'
+          AND t.source_id = 'default'`,
+    );
+    await engine.addLink(
+      'notes/sweep-writer',
+      'concepts/sweep-target',
+      'Obsolete basename edge',
+      'wikilink_basename',
+      'wikilink-resolved',
+    );
 
     await engine.executeRaw(
       `UPDATE pages
@@ -224,7 +283,7 @@ describe('runMaintenanceSweep — link/timeline extraction [CX-P0.3]', () => {
       capabilities: KEYLESS,
     });
     expect(reconciled.linksExtracted).toBe(0);
-    expect(reconciled.linksRemoved).toBe(1);
+    expect(reconciled.linksRemoved).toBe(2);
 
     const rows = await engine.executeRaw<{ link_source: string | null }>(
       `SELECT l.link_source
@@ -237,7 +296,11 @@ describe('runMaintenanceSweep — link/timeline extraction [CX-P0.3]', () => {
           AND pt.source_id = 'default'
         ORDER BY l.link_source`,
     );
-    expect(rows.map(row => row.link_source)).toEqual(['manual']);
+    expect(rows).toHaveLength(4);
+    expect(rows.map(row => row.link_source)).toContain('manual');
+    expect(rows.map(row => row.link_source)).toContain('frontmatter');
+    expect(rows.map(row => row.link_source)).toContain('citation-graph');
+    expect(rows.map(row => row.link_source)).toContain(null);
   });
 
   test('removed cross-source refs delete the exact foreign-target edge', async () => {
@@ -433,6 +496,110 @@ describe('runMaintenanceSweep — link/timeline extraction [CX-P0.3]', () => {
     expect(await engine.getLinks('notes/soft-race-writer', {
       sourceId: 'default',
     })).toHaveLength(1);
+  });
+
+  test('a source deleted between managed read and delete keeps its edge unstamped for recovery', async () => {
+    await seedPage('concepts/soft-source-race-target', 'concept', 'Target page.');
+    await seedPage(
+      'notes/soft-source-race-writer',
+      'note',
+      'References [the target](concepts/soft-source-race-target).',
+    );
+    await runMaintenanceSweep(engine, {
+      sourceId: 'default',
+      capabilities: KEYLESS,
+    });
+    await engine.executeRaw(
+      `UPDATE pages
+          SET compiled_truth = 'The reference is gone.',
+              updated_at = $1
+        WHERE slug = 'notes/soft-source-race-writer' AND source_id = 'default'`,
+      [new Date(Date.now() + 1_000).toISOString()],
+    );
+
+    const ownTransaction = Object.getOwnPropertyDescriptor(engine, 'transaction');
+    const realTransaction = engine.transaction.bind(engine);
+    let injected = false;
+    Object.defineProperty(engine, 'transaction', {
+      configurable: true,
+      value: async (fn: (tx: BrainEngine) => Promise<unknown>) =>
+        realTransaction(async (tx) => {
+          const racingTx = new Proxy(tx as unknown as Record<string | symbol, unknown>, {
+            get(target, prop, receiver) {
+              const value = Reflect.get(target, prop, receiver);
+              if (prop === 'executeRaw' && typeof value === 'function') {
+                return async (sql: string, params?: unknown[]) => {
+                  if (!injected && sql.includes('DELETE FROM links')) {
+                    injected = true;
+                    await (value as (query: string, values?: unknown[]) => unknown).call(
+                      target,
+                      `UPDATE pages
+                          SET deleted_at = now()
+                        WHERE slug = 'notes/soft-source-race-writer'
+                          AND source_id = 'default'`,
+                    );
+                  }
+                  return (value as (query: string, values?: unknown[]) => unknown)
+                    .call(target, sql, params);
+                };
+              }
+              if (typeof value === 'function') {
+                return (...args: unknown[]) =>
+                  (value as (...a: unknown[]) => unknown).apply(target, args);
+              }
+              return value;
+            },
+          }) as unknown as BrainEngine;
+          return fn(racingTx);
+        }),
+    });
+
+    let report: SweepReport;
+    try {
+      report = await runMaintenanceSweep(engine, {
+        sourceId: 'default',
+        capabilities: KEYLESS,
+      });
+    } finally {
+      if (ownTransaction) Object.defineProperty(engine, 'transaction', ownTransaction);
+      else delete (engine as unknown as { transaction?: unknown }).transaction;
+    }
+
+    expect(injected).toBe(true);
+    expect(report!.linksRemoved).toBe(0);
+    const whileDeleted = await engine.executeRaw<{ links: string; stale: string }>(
+      `SELECT COUNT(l.id) AS links,
+              COUNT(*) FILTER (WHERE p.links_extracted_at < p.updated_at) AS stale
+         FROM pages p
+         LEFT JOIN links l ON l.from_page_id = p.id
+        WHERE p.slug = 'notes/soft-source-race-writer'
+          AND p.source_id = 'default'
+          AND p.deleted_at IS NOT NULL`,
+    );
+    expect(parseInt(whileDeleted[0].links, 10)).toBe(1);
+    expect(parseInt(whileDeleted[0].stale, 10)).toBe(1);
+
+    expect(await engine.restorePage('notes/soft-source-race-writer', {
+      sourceId: 'default',
+    })).toBe(true);
+    const restored = await engine.executeRaw<{ stale: string }>(
+      `SELECT COUNT(*) AS stale
+         FROM pages
+        WHERE slug = 'notes/soft-source-race-writer'
+          AND source_id = 'default'
+          AND deleted_at IS NULL
+          AND links_extracted_at < updated_at`,
+    );
+    expect(parseInt(restored[0].stale, 10)).toBe(1);
+
+    const recovered = await runMaintenanceSweep(engine, {
+      sourceId: 'default',
+      capabilities: KEYLESS,
+    });
+    expect(recovered.linksRemoved).toBe(1);
+    expect(await engine.getLinks('notes/soft-source-race-writer', {
+      sourceId: 'default',
+    })).toHaveLength(0);
   });
 
   test('repeated bounded sweeps advance past the first batch', async () => {

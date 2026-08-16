@@ -1232,15 +1232,15 @@ export interface BrainEngine {
    * (from, to, type) row is removed. If omitted, ALL link types between the pair
    * are removed (matches pre-multi-type-link behavior). linkSource additionally
    * constrains the delete to a specific provenance ('frontmatter', 'markdown',
-   * 'manual') — used by runAutoLink reconciliation to avoid deleting edges from
-   * other provenances when pruning frontmatter-derived edges.
+   * 'manual'). `null` targets legacy NULL rows; omission preserves the
+   * historical broad-delete API. `opts.originSlug` narrows to a source-qualified
+   * origin page, or only NULL-origin rows when explicitly `null`.
    */
   removeLink(
     from: string,
     to: string,
-    linkType?: string,
-    linkSource?: string,
-    opts?: { fromSourceId?: string; toSourceId?: string },
+    linkType?: string, linkSource?: string | null,
+    opts?: { fromSourceId?: string; toSourceId?: string; originSlug?: string | null; originSourceId?: string },
   ): Promise<void>;
   /**
    * v0.31.8 (D12 + D16): `opts.sourceId` source-scopes the from-page lookup.
