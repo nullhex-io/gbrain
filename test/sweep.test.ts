@@ -402,13 +402,83 @@ describe('runMaintenanceSweep — link/timeline extraction [CX-P0.3]', () => {
     expect(await engine.getLinks('notes/soft-writer', {
       sourceId: 'default',
     })).toHaveLength(1);
+    const staleWhileDeleted = await engine.executeRaw<{ stale: string }>(
+      `SELECT COUNT(*) AS stale
+         FROM pages
+        WHERE slug = 'notes/soft-writer'
+          AND source_id = 'default'
+          AND deleted_at IS NULL
+          AND links_extracted_at < updated_at`,
+    );
+    expect(parseInt(staleWhileDeleted[0].stale, 10)).toBe(1);
 
     expect(await engine.restorePage('concepts/soft-target', {
       sourceId: 'default',
     })).toBe(true);
+    await runMaintenanceSweep(engine, {
+      sourceId: 'default',
+      capabilities: KEYLESS,
+    });
     expect(await engine.getLinks('notes/soft-writer', {
       sourceId: 'default',
     })).toHaveLength(1);
+    const stampedAfterRestore = await engine.executeRaw<{ stale: string }>(
+      `SELECT COUNT(*) AS stale
+         FROM pages
+        WHERE slug = 'notes/soft-writer'
+          AND source_id = 'default'
+          AND deleted_at IS NULL
+          AND links_extracted_at >= updated_at`,
+    );
+    expect(parseInt(stampedAfterRestore[0].stale, 10)).toBe(1);
+  });
+
+  test('a hard-purged soft target lets a later sweep finish the writer watermark', async () => {
+    await seedPage('concepts/purged-target', 'concept', 'Target page.');
+    await seedPage(
+      'notes/purged-writer',
+      'note',
+      'References [the target](concepts/purged-target).',
+    );
+    await runMaintenanceSweep(engine, {
+      sourceId: 'default',
+      capabilities: KEYLESS,
+    });
+
+    await engine.softDeletePage('concepts/purged-target', { sourceId: 'default' });
+    await engine.executeRaw(
+      `UPDATE pages
+          SET compiled_truth = 'The reference is gone.',
+              updated_at = $1
+        WHERE slug = 'notes/purged-writer' AND source_id = 'default'`,
+      [new Date(Date.now() + 1_000).toISOString()],
+    );
+    await runMaintenanceSweep(engine, {
+      sourceId: 'default',
+      capabilities: KEYLESS,
+    });
+
+    await engine.executeRaw(
+      `DELETE FROM pages
+        WHERE slug = 'concepts/purged-target' AND source_id = 'default'`,
+    );
+    const recovered = await runMaintenanceSweep(engine, {
+      sourceId: 'default',
+      capabilities: KEYLESS,
+    });
+    expect(recovered.linksRemoved).toBe(0);
+    expect(await engine.getLinks('notes/purged-writer', {
+      sourceId: 'default',
+    })).toHaveLength(0);
+    const stampedAfterPurge = await engine.executeRaw<{ stale: string }>(
+      `SELECT COUNT(*) AS stale
+         FROM pages
+        WHERE slug = 'notes/purged-writer'
+          AND source_id = 'default'
+          AND deleted_at IS NULL
+          AND links_extracted_at >= updated_at`,
+    );
+    expect(parseInt(stampedAfterPurge[0].stale, 10)).toBe(1);
   });
 
   test('a target deleted between managed read and delete keeps its recoverable edge', async () => {
@@ -494,9 +564,24 @@ describe('runMaintenanceSweep — link/timeline extraction [CX-P0.3]', () => {
     expect(await engine.restorePage('concepts/soft-race-target', {
       sourceId: 'default',
     })).toBe(true);
+    const restored = await engine.executeRaw<{ stale: string }>(
+      `SELECT COUNT(*) AS stale
+         FROM pages
+        WHERE slug = 'notes/soft-race-writer'
+          AND source_id = 'default'
+          AND deleted_at IS NULL
+          AND links_extracted_at < updated_at`,
+    );
+    expect(parseInt(restored[0].stale, 10)).toBe(1);
+
+    const recovered = await runMaintenanceSweep(engine, {
+      sourceId: 'default',
+      capabilities: KEYLESS,
+    });
+    expect(recovered.linksRemoved).toBe(1);
     expect(await engine.getLinks('notes/soft-race-writer', {
       sourceId: 'default',
-    })).toHaveLength(1);
+    })).toHaveLength(0);
   });
 
   test('a source deleted between managed read and delete keeps its edge unstamped for recovery', async () => {

@@ -577,7 +577,11 @@ async function runLinksTimelinePass(
         );
         report.linksExtracted += reconciled.created;
         report.linksRemoved += reconciled.removed;
-        reconciledRefs.push(ref);
+        // A recoverable target may disappear after endpoint resolution or
+        // between the managed read and guarded delete. Keep its existing edge
+        // and withhold this writer's exact-revision watermark so restore or
+        // hard purge gets a later bounded retry.
+        if (reconciled.complete) reconciledRefs.push(ref);
       } catch (e) {
         skip('link_reconcile_error');
         log(
@@ -618,7 +622,7 @@ async function reconcileSweepLinks(
   slug: string,
   sourceId: string,
   desired: LinkBatchInput[],
-): Promise<{ created: number; removed: number }> {
+): Promise<{ created: number; removed: number; complete: boolean }> {
   return engine.transaction(async (tx) => {
     // Match runAutoLink's existing lock key so a local put_page and the serve
     // sweep cannot reconcile the same slug concurrently.
@@ -676,9 +680,10 @@ async function reconcileSweepLinks(
       to_source_id: string;
       link_type: string;
       link_source: string;
+      target_deleted: boolean;
     }>(
       `SELECT l.id, t.slug AS to_slug, t.source_id AS to_source_id,
-              l.link_type, l.link_source
+              l.link_type, l.link_source, t.deleted_at IS NOT NULL AS target_deleted
          FROM links l
          JOIN pages f ON f.id = l.from_page_id
          JOIN pages t ON t.id = l.to_page_id
@@ -686,8 +691,7 @@ async function reconcileSweepLinks(
           AND f.source_id = $2
           AND f.deleted_at IS NULL
           AND l.link_source IN ('markdown', 'wikilink-resolved')
-          AND l.origin_page_id IS NULL
-          AND t.deleted_at IS NULL`,
+          AND l.origin_page_id IS NULL`,
       [slug, sourceId],
     );
     const keyForDesired = (link: LinkBatchInput): string =>
@@ -695,8 +699,12 @@ async function reconcileSweepLinks(
     const keyForExisting = (link: (typeof managed)[number]): string =>
       `${link.to_source_id}\u0000${link.to_slug}\u0000${link.link_type}\u0000${link.link_source}`;
     const desiredKeys = new Set(desired.map(keyForDesired));
+    // A soft-deleted target is recoverable. Preserve its managed edge even
+    // when it no longer resolves from the candidate map, and withhold the
+    // writer watermark below so a restore or hard purge retries this page.
+    const hasRecoverableTarget = managed.some(link => link.target_deleted);
     const staleIds = managed
-      .filter(link => !desiredKeys.has(keyForExisting(link)))
+      .filter(link => !link.target_deleted && !desiredKeys.has(keyForExisting(link)))
       .map(link => link.id);
     const removed = staleIds.length > 0
       ? (await tx.executeRaw<{ id: number }>(
@@ -712,7 +720,11 @@ async function reconcileSweepLinks(
         )).length
       : 0;
 
-    return { created, removed };
+    // The DELETE repeats both endpoint liveness guards. A target or writer
+    // can soft-delete after the managed read; a short delete therefore means
+    // the transaction deliberately preserved a recoverable edge and must not
+    // stamp the exact writer revision as reconciled.
+    return { created, removed, complete: !hasRecoverableTarget && removed === staleIds.length };
   });
 }
 

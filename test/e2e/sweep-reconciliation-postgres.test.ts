@@ -114,4 +114,79 @@ describePostgres('maintenance sweep link reconciliation on Postgres', () => {
     );
     expect(remaining.map(row => row.link_source)).toEqual(['manual']);
   }, 60_000);
+
+  test('a restored soft target retries stale writer reconciliation before stamping', async () => {
+    await engine.putPage('concepts/pg-soft-sweep-target', {
+      type: 'concept',
+      title: 'Postgres soft sweep target',
+      compiled_truth: 'Target page.',
+      timeline: '',
+    });
+    await engine.putPage('notes/pg-soft-sweep-writer', {
+      type: 'note',
+      title: 'Postgres soft sweep writer',
+      compiled_truth: 'References [the target](concepts/pg-soft-sweep-target).',
+      timeline: '',
+    });
+    await engine.executeRaw(
+      `UPDATE pages
+          SET links_extracted_at = updated_at
+        WHERE slug = 'concepts/pg-soft-sweep-target'
+          AND source_id = 'default'`,
+    );
+
+    const initial = await runMaintenanceSweep(engine, {
+      sourceId: 'default',
+      capabilities: KEYLESS,
+    });
+    expect(initial.linksExtracted).toBe(1);
+    await engine.softDeletePage('concepts/pg-soft-sweep-target', {
+      sourceId: 'default',
+    });
+    await engine.executeRaw(
+      `UPDATE pages
+          SET compiled_truth = 'The reference is gone.',
+              updated_at = $1
+        WHERE slug = 'notes/pg-soft-sweep-writer'
+          AND source_id = 'default'`,
+      [new Date(Date.now() + 1_000).toISOString()],
+    );
+
+    const whileDeleted = await runMaintenanceSweep(engine, {
+      sourceId: 'default',
+      capabilities: KEYLESS,
+    });
+    expect(whileDeleted.linksRemoved).toBe(0);
+    const preserved = await engine.executeRaw<{ links: string; stale: string }>(
+      `SELECT COUNT(l.id) AS links,
+              COUNT(*) FILTER (WHERE p.links_extracted_at < p.updated_at) AS stale
+         FROM pages p
+         LEFT JOIN links l ON l.from_page_id = p.id
+        WHERE p.slug = 'notes/pg-soft-sweep-writer'
+          AND p.source_id = 'default'
+          AND p.deleted_at IS NULL`,
+    );
+    expect(parseInt(preserved[0].links, 10)).toBe(1);
+    expect(parseInt(preserved[0].stale, 10)).toBe(1);
+
+    expect(await engine.restorePage('concepts/pg-soft-sweep-target', {
+      sourceId: 'default',
+    })).toBe(true);
+    const recovered = await runMaintenanceSweep(engine, {
+      sourceId: 'default',
+      capabilities: KEYLESS,
+    });
+    expect(recovered.linksRemoved).toBe(1);
+    const reconciled = await engine.executeRaw<{ links: string; stamped: string }>(
+      `SELECT COUNT(l.id) AS links,
+              COUNT(*) FILTER (WHERE p.links_extracted_at >= p.updated_at) AS stamped
+         FROM pages p
+         LEFT JOIN links l ON l.from_page_id = p.id
+        WHERE p.slug = 'notes/pg-soft-sweep-writer'
+          AND p.source_id = 'default'
+          AND p.deleted_at IS NULL`,
+    );
+    expect(parseInt(reconciled[0].links, 10)).toBe(0);
+    expect(parseInt(reconciled[0].stamped, 10)).toBe(1);
+  }, 60_000);
 });
