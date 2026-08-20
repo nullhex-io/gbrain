@@ -9,7 +9,7 @@
  * helper, and proves that managed rows are removed while manual provenance
  * survives.
  */
-import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
+import { afterAll, beforeAll, beforeEach, describe, expect, test } from 'bun:test';
 
 import type { BrainEngine } from '../../src/core/engine.ts';
 import type { CapabilityReport } from '../../src/core/capability.ts';
@@ -36,6 +36,11 @@ describePostgres('maintenance sweep link reconciliation on Postgres', () => {
   afterAll(async () => {
     await teardownDB();
   }, 30_000);
+
+  beforeEach(async () => {
+    const cursorKeys = await engine.listConfigKeys('sweep.links_timeline.cursor.v1.');
+    await Promise.all(cursorKeys.map(key => engine.unsetConfig(key)));
+  });
 
   test('uses an RLS-safe transaction-local batch and prunes stale managed edges', async () => {
     await engine.putPage('concepts/pg-sweep-target', {
@@ -115,6 +120,111 @@ describePostgres('maintenance sweep link reconciliation on Postgres', () => {
     expect(remaining.map(row => row.link_source)).toEqual(['manual']);
   }, 60_000);
 
+  test('an exact legacy NULL-provenance row satisfies a desired markdown edge', async () => {
+    await engine.putPage('concepts/pg-legacy-null-target', {
+      type: 'concept',
+      title: 'Postgres legacy NULL target',
+      compiled_truth: 'Target page.',
+      timeline: '',
+    });
+    await engine.putPage('notes/pg-legacy-null-writer', {
+      type: 'note',
+      title: 'Postgres legacy NULL writer',
+      compiled_truth: 'References [the target](concepts/pg-legacy-null-target).',
+      timeline: '',
+    });
+    await engine.executeRaw(
+      `INSERT INTO links (from_page_id, to_page_id, link_type, context, link_source)
+       SELECT f.id, t.id, 'mentions', 'Legacy edge', NULL
+         FROM pages f
+         JOIN pages t ON true
+        WHERE f.slug = 'notes/pg-legacy-null-writer'
+          AND f.source_id = 'default'
+          AND t.slug = 'concepts/pg-legacy-null-target'
+          AND t.source_id = 'default'`,
+    );
+
+    const reconciled = await runMaintenanceSweep(engine, {
+      sourceId: 'default',
+      capabilities: KEYLESS,
+    });
+    expect(reconciled.linksExtracted).toBe(0);
+    const rows = await engine.executeRaw<{ link_source: string | null }>(
+      `SELECT l.link_source
+         FROM links l
+         JOIN pages f ON f.id = l.from_page_id
+         JOIN pages t ON t.id = l.to_page_id
+        WHERE f.slug = 'notes/pg-legacy-null-writer'
+          AND f.source_id = 'default'
+          AND t.slug = 'concepts/pg-legacy-null-target'
+          AND t.source_id = 'default'`,
+    );
+    expect(rows).toEqual([{ link_source: null }]);
+  }, 60_000);
+
+  test('a soft-deleted local target shadows the active default fallback', async () => {
+    await engine.executeRaw(
+      `INSERT INTO sources (id, name)
+       VALUES ('custom', 'custom')
+       ON CONFLICT (id) DO NOTHING`,
+    );
+    await engine.putPage('concepts/pg-shadow-same', {
+      type: 'concept',
+      title: 'Postgres default target',
+      compiled_truth: 'Default target.',
+      timeline: '',
+    });
+    await engine.putPage('concepts/pg-shadow-same', {
+      type: 'concept',
+      title: 'Postgres custom target',
+      compiled_truth: 'Custom target.',
+      timeline: '',
+    }, { sourceId: 'custom' });
+    await engine.putPage('notes/pg-shadow-writer', {
+      type: 'note',
+      title: 'Postgres custom writer',
+      compiled_truth: 'References [the target](concepts/pg-shadow-same).',
+      timeline: '',
+    }, { sourceId: 'custom' });
+    await engine.softDeletePage('concepts/pg-shadow-same', { sourceId: 'custom' });
+
+    const whileDeleted = await runMaintenanceSweep(engine, {
+      sourceId: 'custom',
+      capabilities: KEYLESS,
+    });
+    expect(whileDeleted.linksExtracted).toBe(0);
+    const deferred = await engine.executeRaw<{ links: string; stale: string }>(
+      `SELECT COUNT(l.id) AS links,
+              COUNT(*) FILTER (
+                WHERE p.links_extracted_at IS NULL
+                   OR p.links_extracted_at < p.updated_at
+              ) AS stale
+         FROM pages p
+         LEFT JOIN links l ON l.from_page_id = p.id
+        WHERE p.slug = 'notes/pg-shadow-writer'
+          AND p.source_id = 'custom'
+          AND p.deleted_at IS NULL`,
+    );
+    expect(parseInt(deferred[0].links, 10)).toBe(0);
+    expect(parseInt(deferred[0].stale, 10)).toBe(1);
+
+    expect(await engine.restorePage('concepts/pg-shadow-same', { sourceId: 'custom' })).toBe(true);
+    const recovered = await runMaintenanceSweep(engine, {
+      sourceId: 'custom',
+      capabilities: KEYLESS,
+    });
+    expect(recovered.linksExtracted).toBe(1);
+    const target = await engine.executeRaw<{ source_id: string }>(
+      `SELECT t.source_id
+         FROM links l
+         JOIN pages f ON f.id = l.from_page_id
+         JOIN pages t ON t.id = l.to_page_id
+        WHERE f.slug = 'notes/pg-shadow-writer'
+          AND f.source_id = 'custom'`,
+    );
+    expect(target).toEqual([{ source_id: 'custom' }]);
+  }, 60_000);
+
   test('a restored soft target retries stale writer reconciliation before stamping', async () => {
     await engine.putPage('concepts/pg-soft-sweep-target', {
       type: 'concept',
@@ -187,6 +297,64 @@ describePostgres('maintenance sweep link reconciliation on Postgres', () => {
           AND p.deleted_at IS NULL`,
     );
     expect(parseInt(reconciled[0].links, 10)).toBe(0);
+    expect(parseInt(reconciled[0].stamped, 10)).toBe(1);
+  }, 60_000);
+
+  test('a target deleted before the first sweep leaves its writer retryable', async () => {
+    await engine.putPage('concepts/pg-first-sweep-soft-target', {
+      type: 'concept',
+      title: 'Postgres first-sweep soft target',
+      compiled_truth: 'Target page.',
+      timeline: '',
+    });
+    await engine.putPage('notes/pg-first-sweep-soft-writer', {
+      type: 'note',
+      title: 'Postgres first-sweep soft writer',
+      compiled_truth: 'References [the target](concepts/pg-first-sweep-soft-target).',
+      timeline: '',
+    });
+    await engine.softDeletePage('concepts/pg-first-sweep-soft-target', {
+      sourceId: 'default',
+    });
+
+    const whileDeleted = await runMaintenanceSweep(engine, {
+      sourceId: 'default',
+      capabilities: KEYLESS,
+    });
+    expect(whileDeleted.linksExtracted).toBe(0);
+    const deferred = await engine.executeRaw<{ links: string; stale: string }>(
+      `SELECT COUNT(l.id) AS links,
+              COUNT(*) FILTER (
+                WHERE p.links_extracted_at IS NULL
+                   OR p.links_extracted_at < p.updated_at
+              ) AS stale
+         FROM pages p
+         LEFT JOIN links l ON l.from_page_id = p.id
+        WHERE p.slug = 'notes/pg-first-sweep-soft-writer'
+          AND p.source_id = 'default'
+          AND p.deleted_at IS NULL`,
+    );
+    expect(parseInt(deferred[0].links, 10)).toBe(0);
+    expect(parseInt(deferred[0].stale, 10)).toBe(1);
+
+    expect(await engine.restorePage('concepts/pg-first-sweep-soft-target', {
+      sourceId: 'default',
+    })).toBe(true);
+    const recovered = await runMaintenanceSweep(engine, {
+      sourceId: 'default',
+      capabilities: KEYLESS,
+    });
+    expect(recovered.linksExtracted).toBe(1);
+    const reconciled = await engine.executeRaw<{ links: string; stamped: string }>(
+      `SELECT COUNT(l.id) AS links,
+              COUNT(*) FILTER (WHERE p.links_extracted_at >= p.updated_at) AS stamped
+         FROM pages p
+         LEFT JOIN links l ON l.from_page_id = p.id
+        WHERE p.slug = 'notes/pg-first-sweep-soft-writer'
+          AND p.source_id = 'default'
+          AND p.deleted_at IS NULL`,
+    );
+    expect(parseInt(reconciled[0].links, 10)).toBe(1);
     expect(parseInt(reconciled[0].stamped, 10)).toBe(1);
   }, 60_000);
 });

@@ -25,6 +25,26 @@ export async function lookupLinkCandidateSources(
   engine: BrainEngine,
   slugs: Iterable<string>,
 ): Promise<LinkSourceLookup> {
+  return lookupCandidateSources(engine, slugs, true);
+}
+
+/**
+ * Loads active and soft-deleted `(slug, source_id)` pairs for exactly the
+ * requested slugs. Sweep reconciliation uses this only to defer a writer
+ * watermark when a currently-unresolvable link can recover after restore.
+ */
+export async function lookupRecoverableLinkCandidateSources(
+  engine: BrainEngine,
+  slugs: Iterable<string>,
+): Promise<LinkSourceLookup> {
+  return lookupCandidateSources(engine, slugs, false);
+}
+
+async function lookupCandidateSources(
+  engine: BrainEngine,
+  slugs: Iterable<string>,
+  activeOnly: boolean,
+): Promise<LinkSourceLookup> {
   const requested = [...new Set(slugs)];
   const allSlugs = new Set<string>();
   const slugToSources = new Map<string, string[]>();
@@ -35,7 +55,7 @@ export async function lookupLinkCandidateSources(
     const placeholders = chunk.map((_, j) => `$${j + 1}`).join(', ');
     const rows = await engine.executeRaw<{ slug: string; source_id: string }>(
       `SELECT slug, source_id FROM pages
-        WHERE deleted_at IS NULL AND slug IN (${placeholders})
+        WHERE ${activeOnly ? 'deleted_at IS NULL AND ' : ''}slug IN (${placeholders})
         ORDER BY source_id, slug`,
       chunk,
     );

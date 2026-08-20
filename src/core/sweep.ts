@@ -49,7 +49,13 @@ import type { FactsBackstopCtx } from './facts/backstop.ts';
 import { detectCapabilities, type CapabilityReport } from './capability.ts';
 import { buildLinkRows } from './batch-rows.ts';
 import { executeRawJsonb } from './sql-query.ts';
-import { autoLinkLockKey, lookupLinkCandidateSources, resolveCandidateSources } from './link-source-resolution.ts';
+import {
+  autoLinkLockKey,
+  lookupLinkCandidateSources,
+  lookupRecoverableLinkCandidateSources,
+  resolveCandidateSources,
+} from './link-source-resolution.ts';
+import { ALL_SOURCES } from './source-id.ts';
 
 /** Delay before the serve-startup sweep fires (post-connect settle). */
 export const STARTUP_SWEEP_DELAY_MS = 3_000;
@@ -90,7 +96,7 @@ export interface SweepOpts {
   batchLimit?: number;
   /** Wall-clock budget; the sweep stops between items when exceeded. Default 5000. */
   budgetMs?: number;
-  /** Recency window (days) for "recently-modified pages". Default 7. */
+  /** Optional recency window (days) for programmatically bounded scans. */
   recentDays?: number;
   /** Diagnostic sink (stderr in serve contexts). Default: silent. */
   log?: (msg: string) => void;
@@ -126,12 +132,6 @@ export async function runMaintenanceSweep(
 ): Promise<SweepReport> {
   const started = Date.now();
   const sourceId = opts.sourceId ?? 'default';
-  const batchLimit = Math.max(1, opts.batchLimit ?? 20);
-  const budgetMs = Math.max(0, opts.budgetMs ?? 5_000);
-  const recentDays = Math.max(1, opts.recentDays ?? 7);
-  const log = opts.log ?? (() => {});
-  const deadline = started + budgetMs;
-
   const report: SweepReport = {
     corpusIngested: 0,
     factsReconciled: 0,
@@ -141,6 +141,23 @@ export async function runMaintenanceSweep(
     skipped: [],
     durationMs: 0,
   };
+
+  // The all-sources sentinel is read-only. Refuse it here, before creating a
+  // timer or touching engine/filesystem state, because callers can invoke the
+  // core directly without the CLI and serve-layer source fences.
+  if (sourceId === ALL_SOURCES) {
+    report.skipped.push({ reason: 'source_binding_required', count: 1 });
+    report.durationMs = Date.now() - started;
+    return report;
+  }
+
+  const batchLimit = Math.max(1, opts.batchLimit ?? 20);
+  const budgetMs = Math.max(0, opts.budgetMs ?? 5_000);
+  const recentDays = opts.recentDays === undefined
+    ? undefined
+    : Math.max(1, opts.recentDays);
+  const log = opts.log ?? (() => {});
+  const deadline = started + budgetMs;
 
   const skip = (reason: string, count = 1): void => {
     if (count <= 0) return;
@@ -161,7 +178,11 @@ export async function runMaintenanceSweep(
   );
   budgetTimer.unref?.();
 
-  const cutoffIso = new Date(started - recentDays * 86_400_000).toISOString();
+  // An omitted bound must converge over every stale page. Each pass stays
+  // bounded by its own LIMIT, continuation cursor, and wall-clock budget.
+  const cutoffIso = recentDays === undefined
+    ? new Date(0).toISOString()
+    : new Date(started - recentDays * 86_400_000).toISOString();
 
   try {
     // ── Pass 1: facts-fence reconciliation [CX2-4] — zero-LLM ─────────
@@ -523,6 +544,7 @@ async function runLinksTimelinePass(
   // only the rows it can possibly use. Zero candidates ⇒ zero queries.
   const desiredLinks = new Map<string, LinkBatchInput[]>();
   for (const ref of processedRefs) desiredLinks.set(ref.slug, []);
+  const recoverableWriterSlugs = new Set<string>();
   if (pageCandidates.length > 0) {
     const needed = new Set<string>();
     for (const { slug, candidates } of pageCandidates) {
@@ -532,11 +554,43 @@ async function runLinksTimelinePass(
         if (c.fromSlug) needed.add(c.fromSlug);
       }
     }
-    const lookup = await lookupLinkCandidateSources(engine, needed);
+    const [lookup, recoverableLookup] = await Promise.all([
+      lookupLinkCandidateSources(engine, needed),
+      lookupRecoverableLinkCandidateSources(engine, needed),
+    ]);
     for (const { slug, candidates } of pageCandidates) {
       for (const c of candidates) {
         const resolved = resolveCandidateSources(c, slug, sourceId, lookup);
-        if (!resolved) continue;
+        // The active lookup deliberately hides soft-deleted endpoints. A
+        // second, equally bounded lookup identifies candidates that would
+        // resolve after restoration. This also detects a local soft-delete
+        // shadowing an active default fallback: writing that fallback would
+        // stamp the writer and make restoration unable to correct it.
+        const recoverable = resolveCandidateSources(
+          c, slug, sourceId, recoverableLookup,
+        );
+        const localRecoverableTargetShadowsFallback = Boolean(
+          resolved
+          && recoverable
+          && resolved.toSourceId !== sourceId
+          && recoverable.toSourceId === sourceId
+          && recoverable.fromSlug === slug
+          && recoverable.fromSourceId === sourceId,
+        );
+        if (!resolved || localRecoverableTargetShadowsFallback) {
+          // Do not watermark the writer: a hard purge removes this condition,
+          // while a restore retries and creates the local edge. Truly missing
+          // local targets do not resolve from recoverableLookup and continue
+          // to fall back to the active default target.
+          if (
+            recoverable
+            && recoverable.fromSlug === slug
+            && recoverable.fromSourceId === sourceId
+          ) {
+            recoverableWriterSlugs.add(slug);
+          }
+          continue;
+        }
         if (resolved.fromSlug !== slug || resolved.fromSourceId !== sourceId) {
           throw new Error(
             `sweep extraction emitted a non-outgoing edge for ${sourceId}:${slug}`,
@@ -581,7 +635,9 @@ async function runLinksTimelinePass(
         // between the managed read and guarded delete. Keep its existing edge
         // and withhold this writer's exact-revision watermark so restore or
         // hard purge gets a later bounded retry.
-        if (reconciled.complete) reconciledRefs.push(ref);
+        if (reconciled.complete && !recoverableWriterSlugs.has(ref.slug)) {
+          reconciledRefs.push(ref);
+        }
       } catch (e) {
         skip('link_reconcile_error');
         log(
@@ -665,6 +721,18 @@ async function reconcileSweepLinks(
                ON t.slug = v.to_slug AND t.source_id = v.to_source_id
              LEFT JOIN pages o
                ON o.slug = v.origin_slug AND o.source_id = v.origin_source_id
+            WHERE NOT EXISTS (
+              SELECT 1
+                FROM links existing
+               WHERE existing.from_page_id = f.id
+                 AND existing.to_page_id = t.id
+                 AND existing.link_type IS NOT DISTINCT FROM v.link_type
+                 AND existing.origin_page_id IS NULL
+                 AND (
+                   existing.link_source = v.link_source
+                   OR (v.link_source = 'markdown' AND existing.link_source IS NULL)
+                 )
+            )
            ON CONFLICT (
              from_page_id, to_page_id, link_type, link_source, origin_page_id
            ) DO NOTHING

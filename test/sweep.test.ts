@@ -151,7 +151,7 @@ describe('runMaintenanceSweep — facts-fence reconciliation [CX2-4]', () => {
 });
 
 describe('runMaintenanceSweep — link/timeline extraction [CX-P0.3]', () => {
-  test('re-extracts and clears pages stale only by extractor version', async () => {
+  test('re-extracts an older-than-seven-days page by default', async () => {
     await seedPage('notes/version-stale-writer', 'note', 'No links.');
     await engine.executeRaw(
       `UPDATE pages
@@ -163,7 +163,6 @@ describe('runMaintenanceSweep — link/timeline extraction [CX-P0.3]', () => {
     await runMaintenanceSweep(engine, {
       sourceId: 'default',
       capabilities: KEYLESS,
-      recentDays: 36_500,
     });
 
     const rows = await engine.executeRaw<{ extracted_at: string }>(
@@ -304,6 +303,99 @@ describe('runMaintenanceSweep — link/timeline extraction [CX-P0.3]', () => {
     expect(rows.map(row => row.link_source)).toContain(null);
   });
 
+  test('a desired markdown edge reuses an exact legacy NULL-provenance row', async () => {
+    await seedPage('concepts/legacy-null-target', 'concept', 'Target page.');
+    await seedPage(
+      'notes/legacy-null-writer',
+      'note',
+      'References [the target](concepts/legacy-null-target).',
+    );
+    await engine.executeRaw(
+      `INSERT INTO links (from_page_id, to_page_id, link_type, context, link_source)
+       SELECT f.id, t.id, 'mentions', 'Legacy edge', NULL
+         FROM pages f
+         JOIN pages t ON true
+        WHERE f.slug = 'notes/legacy-null-writer'
+          AND f.source_id = 'default'
+          AND t.slug = 'concepts/legacy-null-target'
+          AND t.source_id = 'default'`,
+    );
+
+    const reconciled = await runMaintenanceSweep(engine, {
+      sourceId: 'default',
+      capabilities: KEYLESS,
+    });
+    expect(reconciled.linksExtracted).toBe(0);
+    const rows = await engine.executeRaw<{ link_source: string | null }>(
+      `SELECT l.link_source
+         FROM links l
+         JOIN pages f ON f.id = l.from_page_id
+         JOIN pages t ON t.id = l.to_page_id
+        WHERE f.slug = 'notes/legacy-null-writer'
+          AND f.source_id = 'default'
+          AND t.slug = 'concepts/legacy-null-target'
+          AND t.source_id = 'default'`,
+    );
+    expect(rows).toHaveLength(1);
+    expect(rows[0].link_source).toBeNull();
+  });
+
+  test('a soft-deleted local target does not fall back to an active default target', async () => {
+    await engine.executeRaw(
+      `INSERT INTO sources (id, name)
+       VALUES ('custom', 'custom')
+       ON CONFLICT (id) DO NOTHING`,
+    );
+    await seedPage('concepts/same', 'concept', 'Default target.');
+    await engine.executeRaw(
+      `INSERT INTO pages (slug, source_id, type, title, compiled_truth, timeline)
+       VALUES
+         ('concepts/same', 'custom', 'concept', 'Custom target', 'Custom target.', ''),
+         ('notes/custom-shadow-writer', 'custom', 'note', 'Custom writer',
+          'References [the target](concepts/same).', '')`,
+    );
+    await engine.softDeletePage('concepts/same', { sourceId: 'custom' });
+
+    const whileDeleted = await runMaintenanceSweep(engine, {
+      sourceId: 'custom',
+      capabilities: KEYLESS,
+    });
+    expect(whileDeleted.linksExtracted).toBe(0);
+    const deferred = await engine.executeRaw<{
+      links: string;
+      stale: string;
+    }>(
+      `SELECT COUNT(l.id) AS links,
+              COUNT(*) FILTER (
+                WHERE p.links_extracted_at IS NULL
+                   OR p.links_extracted_at < p.updated_at
+              ) AS stale
+         FROM pages p
+         LEFT JOIN links l ON l.from_page_id = p.id
+        WHERE p.slug = 'notes/custom-shadow-writer'
+          AND p.source_id = 'custom'
+          AND p.deleted_at IS NULL`,
+    );
+    expect(parseInt(deferred[0].links, 10)).toBe(0);
+    expect(parseInt(deferred[0].stale, 10)).toBe(1);
+
+    expect(await engine.restorePage('concepts/same', { sourceId: 'custom' })).toBe(true);
+    const recovered = await runMaintenanceSweep(engine, {
+      sourceId: 'custom',
+      capabilities: KEYLESS,
+    });
+    expect(recovered.linksExtracted).toBe(1);
+    const target = await engine.executeRaw<{ source_id: string }>(
+      `SELECT t.source_id
+         FROM links l
+         JOIN pages f ON f.id = l.from_page_id
+         JOIN pages t ON t.id = l.to_page_id
+        WHERE f.slug = 'notes/custom-shadow-writer'
+          AND f.source_id = 'custom'`,
+    );
+    expect(target).toEqual([{ source_id: 'custom' }]);
+  });
+
   test('removed cross-source refs delete the exact foreign-target edge', async () => {
     await engine.executeRaw(
       `INSERT INTO sources (id, name)
@@ -431,6 +523,91 @@ describe('runMaintenanceSweep — link/timeline extraction [CX-P0.3]', () => {
           AND links_extracted_at >= updated_at`,
     );
     expect(parseInt(stampedAfterRestore[0].stale, 10)).toBe(1);
+  });
+
+  test('a target deleted before the first sweep keeps its writer stale until restore', async () => {
+    await seedPage('concepts/first-sweep-soft-target', 'concept', 'Target page.');
+    await seedPage(
+      'notes/first-sweep-soft-writer',
+      'note',
+      'References [the target](concepts/first-sweep-soft-target).',
+    );
+    await engine.softDeletePage('concepts/first-sweep-soft-target', {
+      sourceId: 'default',
+    });
+
+    const whileDeleted = await runMaintenanceSweep(engine, {
+      sourceId: 'default',
+      capabilities: KEYLESS,
+    });
+    expect(whileDeleted.linksExtracted).toBe(0);
+    expect(await engine.getLinks('notes/first-sweep-soft-writer', {
+      sourceId: 'default',
+    })).toHaveLength(0);
+    const staleWhileDeleted = await engine.executeRaw<{ stale: string }>(
+      `SELECT COUNT(*) AS stale
+         FROM pages
+        WHERE slug = 'notes/first-sweep-soft-writer'
+          AND source_id = 'default'
+          AND deleted_at IS NULL
+          AND (links_extracted_at IS NULL OR links_extracted_at < updated_at)`,
+    );
+    expect(parseInt(staleWhileDeleted[0].stale, 10)).toBe(1);
+
+    expect(await engine.restorePage('concepts/first-sweep-soft-target', {
+      sourceId: 'default',
+    })).toBe(true);
+    const recovered = await runMaintenanceSweep(engine, {
+      sourceId: 'default',
+      capabilities: KEYLESS,
+    });
+    expect(recovered.linksExtracted).toBe(1);
+    expect(await engine.getLinks('notes/first-sweep-soft-writer', {
+      sourceId: 'default',
+    })).toHaveLength(1);
+    const stampedAfterRestore = await engine.executeRaw<{ stamped: string }>(
+      `SELECT COUNT(*) AS stamped
+         FROM pages
+        WHERE slug = 'notes/first-sweep-soft-writer'
+          AND source_id = 'default'
+          AND deleted_at IS NULL
+          AND links_extracted_at >= updated_at`,
+    );
+    expect(parseInt(stampedAfterRestore[0].stamped, 10)).toBe(1);
+  });
+
+  test('a first-sweep soft target hard purge lets its writer finish', async () => {
+    await seedPage('concepts/first-sweep-purged-target', 'concept', 'Target page.');
+    await seedPage(
+      'notes/first-sweep-purged-writer',
+      'note',
+      'References [the target](concepts/first-sweep-purged-target).',
+    );
+    await engine.softDeletePage('concepts/first-sweep-purged-target', {
+      sourceId: 'default',
+    });
+    await runMaintenanceSweep(engine, {
+      sourceId: 'default',
+      capabilities: KEYLESS,
+    });
+
+    await engine.deletePage('concepts/first-sweep-purged-target', {
+      sourceId: 'default',
+    });
+    const afterPurge = await runMaintenanceSweep(engine, {
+      sourceId: 'default',
+      capabilities: KEYLESS,
+    });
+    expect(afterPurge.linksExtracted).toBe(0);
+    const stampedAfterPurge = await engine.executeRaw<{ stamped: string }>(
+      `SELECT COUNT(*) AS stamped
+         FROM pages
+        WHERE slug = 'notes/first-sweep-purged-writer'
+          AND source_id = 'default'
+          AND deleted_at IS NULL
+          AND links_extracted_at >= updated_at`,
+    );
+    expect(parseInt(stampedAfterPurge[0].stamped, 10)).toBe(1);
   });
 
   test('a hard-purged soft target lets a later sweep finish the writer watermark', async () => {
@@ -1454,6 +1631,24 @@ describe('runMaintenanceSweep — bounded link resolution (no listAllPageRefs)',
 });
 
 describe('runMaintenanceSweep — budget + never-throw', () => {
+  test('the all-sources sentinel returns before touching the engine', async () => {
+    const touched: string[] = [];
+    const fake = new Proxy({}, {
+      get(_target, property) {
+        touched.push(String(property));
+        throw new Error(`unexpected engine access: ${String(property)}`);
+      },
+    }) as BrainEngine;
+
+    const report = await runMaintenanceSweep(fake, {
+      sourceId: '__all__',
+      capabilities: KEYLESS,
+    });
+
+    expect(report.skipped).toEqual([{ reason: 'source_binding_required', count: 1 }]);
+    expect(touched).toEqual([]);
+  });
+
   test('budget exhaustion between page transactions stops further reconciliation', async () => {
     await seedPage('concepts/budget-target', 'concept', 'Target page.');
     await engine.executeRaw(
