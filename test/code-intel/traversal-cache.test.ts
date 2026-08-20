@@ -11,6 +11,8 @@
  */
 import { describe, test, expect, beforeAll, afterAll, beforeEach } from 'bun:test';
 import { PGLiteEngine } from '../../src/core/pglite-engine.ts';
+import type { BrainEngine } from '../../src/core/engine.ts';
+import { operations, type OperationContext } from '../../src/core/operations.ts';
 import { resetPgliteState } from '../helpers/reset-pglite.ts';
 import {
   getCachedTraversal,
@@ -45,6 +47,24 @@ const baseKey = (over: Partial<CacheKey> = {}): CacheKey => ({
   cluster_generation: 0,
   ...over,
 });
+
+const clearOperation = operations.find((operation) => operation.name === 'code_traversal_cache_clear');
+if (!clearOperation) throw new Error('code_traversal_cache_clear operation missing');
+
+function operationContext(
+  engine: BrainEngine,
+  dryRun = false,
+  sourceId = 'default',
+): OperationContext {
+  return {
+    engine,
+    config: {} as OperationContext['config'],
+    logger: { info: () => {}, warn: () => {}, error: () => {} },
+    dryRun,
+    remote: false,
+    sourceId,
+  };
+}
 
 describe('W3b: getClusterGeneration / bumpClusterGeneration', () => {
   test('defaults to 0 when never set', async () => {
@@ -101,6 +121,49 @@ describe('W3b: putCachedTraversal / getCachedTraversal', () => {
 });
 
 describe('W3b: clearTraversalCache', () => {
+  test('operation rejects source_id=__all__ before touching the engine', async () => {
+    const untouched = new Proxy({} as BrainEngine, {
+      get() {
+        throw new Error('sentinel fence must run before engine access');
+      },
+    });
+
+    const result = clearOperation.handler(operationContext(untouched), {
+      source_id: '__all__',
+    });
+
+    await expect(result).rejects.toMatchObject({ code: 'source_binding_required' });
+  });
+
+  test('operation rejects an ambient __all__ source unless full wipe is explicit', async () => {
+    const untouched = new Proxy({} as BrainEngine, {
+      get() {
+        throw new Error('ambient sentinel fence must run before engine access');
+      },
+    });
+
+    const result = clearOperation.handler(operationContext(untouched, false, '__all__'), {});
+
+    await expect(result).rejects.toMatchObject({ code: 'source_binding_required' });
+    await expect(clearOperation.handler(
+      operationContext({} as BrainEngine, true, '__all__'),
+      { all_sources: true },
+    )).resolves.toMatchObject({ dry_run: true, all_sources: true });
+  });
+
+  test('operation preserves concrete and explicit all-source dry runs', async () => {
+    const ctx = operationContext({} as BrainEngine, true);
+    await expect(clearOperation.handler(ctx, { source_id: 'src-a' })).resolves.toMatchObject({
+      dry_run: true,
+      source_id: 'src-a',
+      all_sources: false,
+    });
+    await expect(clearOperation.handler(ctx, { all_sources: true })).resolves.toMatchObject({
+      dry_run: true,
+      all_sources: true,
+    });
+  });
+
   test('refuses without source_id or all_sources', async () => {
     await expect(clearTraversalCache(engine, {})).rejects.toThrow(/specify source_id/);
   });

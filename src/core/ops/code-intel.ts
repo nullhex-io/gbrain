@@ -8,8 +8,9 @@
  * Never import from '../operations.ts' here (cycle).
  */
 
-import type { Operation } from './contract.ts';
+import { OperationError, type Operation } from './contract.ts';
 import { resolveCodeIntelScope } from './context.ts';
+import { ALL_SOURCES } from '../source-id.ts';
 import {
   CODE_CALLERS_DESCRIPTION,
   CODE_CALLEES_DESCRIPTION,
@@ -231,9 +232,16 @@ const code_traversal_cache_clear: Operation = {
     // INTENTIONAL exemption from resolveRequestedScope: this is a localOnly
     // admin/destructive op with its own D8 all_sources guard. The read-side
     // trust+grant resolver does not apply here (no remote caller reaches it).
-    const { clearTraversalCache } = await import('../code-intel/traversal-cache.ts');
     const sourceId = (p.source_id as string | undefined) ?? ctx.sourceId;
     const allSources = (p.all_sources as boolean) ?? false;
+    if (p.source_id === ALL_SOURCES || (!allSources && sourceId === ALL_SOURCES)) {
+      throw new OperationError(
+        'source_binding_required',
+        'code_traversal_cache_clear requires one concrete source; __all__ is read-only.',
+        'Pass one concrete source_id, or omit source_id and pass all_sources=true for an explicit full wipe.',
+      );
+    }
+    const { clearTraversalCache } = await import('../code-intel/traversal-cache.ts');
     if (ctx.dryRun) {
       return { dry_run: true, action: 'code_traversal_cache_clear', source_id: sourceId, all_sources: allSources };
     }
