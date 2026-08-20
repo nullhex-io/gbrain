@@ -24,6 +24,7 @@ import {
   ABORT_REASON_LOCK_LOST,
 } from './types.ts';
 import { MinionQueue } from './queue.ts';
+import { allSourcesJobBindingField, allSourcesJobBindingMessage } from './source-binding.ts';
 import { runWaitingTtlTick, ttlNoticeGraceMs } from './admission.ts';
 import { calculateBackoff } from './backoff.ts';
 import { RateLeaseUnavailableError } from './handlers/subagent.ts';
@@ -1269,6 +1270,20 @@ export class MinionWorker extends EventEmitter {
     abort: AbortController,
     lockTimer: ReturnType<typeof setInterval>,
   ): Promise<void> {
+    // Legacy or external writers can bypass MinionQueue.add. Reject the
+    // read-only federation selector before handler lookup, child-process
+    // launch, context construction, filesystem work, or model calls.
+    const allSourcesField = allSourcesJobBindingField(job.data);
+    if (allSourcesField) {
+      await this.queue.failJob(
+        job.id,
+        lockToken,
+        allSourcesJobBindingMessage(allSourcesField),
+        'dead',
+      );
+      return;
+    }
+
     const handler = this.handlers.get(job.name);
     if (!handler) {
       await this.queue.failJob(job.id, lockToken, `No handler for job type '${job.name}'`, 'dead');

@@ -47,12 +47,17 @@ const submit_job: Operation = {
     }
 
     const { MinionQueue } = await import('../minions/queue.ts');
+    const { allSourcesJobBindingField, allSourcesJobBindingMessage } = await import('../minions/source-binding.ts');
     const queue = new MinionQueue(ctx.engine);
     // Trusted flag fires ONLY for an explicit local CLI submission of a protected
     // name. Strict `=== false` so an untyped/cast context can't escalate.
     const trusted = ctx.remote === false && isProtectedJobName(name) ? { allowProtectedSubmit: true } : undefined;
 
     const jobData = (p.data as Record<string, unknown>) || {};
+    const allSourcesField = allSourcesJobBindingField(jobData);
+    if (allSourcesField) {
+      throw new OperationError('invalid_params', allSourcesJobBindingMessage(allSourcesField));
+    }
 
     // v0.35.8.0: pre-enqueue shell-job validation, parity with the CLI submit
     // path. Closes the bug class where shell.ts handler-time validation ran

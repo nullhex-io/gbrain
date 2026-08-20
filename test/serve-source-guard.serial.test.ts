@@ -228,10 +228,10 @@ describe('resolveMcpStdioSourceScope tier passthrough', () => {
     expect(scope.tier).toBe('env');
   });
 
-  test('GBRAIN_SOURCE=__all__ survives capability enumeration failure fail-closed', async () => {
+  test('GBRAIN_SOURCE=__all__ rejects capability enumeration failure visibly', async () => {
     process.env.GBRAIN_SOURCE = '__all__';
-    const scope = await resolveMcpStdioSourceScope(throwingEngine, '/nonexistent/plugin-snapshot');
-    expect(scope).toEqual({ sourceId: '__all__', tier: 'env' });
+    await expect(resolveMcpStdioSourceScope(throwingEngine, '/nonexistent/plugin-snapshot'))
+      .rejects.toThrow('Unable to enumerate active sources');
   });
 });
 

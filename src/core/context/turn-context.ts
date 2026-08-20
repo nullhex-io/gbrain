@@ -134,6 +134,8 @@ export interface TurnContextResult {
 
 export interface AssembleTurnContextOpts {
   sourceId: string;
+  /** Server-issued stateless read span for ambient PGLite IPC only. */
+  sourceIds?: string[];
   /** Recent turns, oldest → newest. Optional for pack/delta (may run cold). */
   window?: WindowTurn[];
   /** Already-surfaced context — drives slug-only suppression + volunteer dedupe. */
@@ -226,6 +228,7 @@ export async function assembleTurnContext(
           suppression: 'slug-only',
           maxPointers: DEFAULT_MAX_POINTERS,
           lexicalArms: opts.lexicalArms,
+          sourceIds: opts.sourceIds,
         });
         pointers = block?.pointers ?? [];
       }
@@ -240,7 +243,7 @@ export async function assembleTurnContext(
       if (window.length) {
         const excludeSlugs = new Set(pointers.map((p) => p.slug));
         volunteered = await volunteerContext(engine, window, {
-          sourceIds: [opts.sourceId],
+          sourceIds: opts.sourceIds?.length ? opts.sourceIds : [opts.sourceId],
           priorContext: opts.priorContextText,
           excludeSlugs,
           maxPages: MAX_VOLUNTEERED_PAGES,
@@ -268,6 +271,7 @@ export async function assembleTurnContext(
         dryRun: false,
         remote: true, // S3#1 — never widen past the remote/world posture
         sourceId: opts.sourceId,
+        localFederatedSourceIds: opts.sourceIds,
         sessionId: opts.sessionId,
         takesHoldersAllowList: ['world'],
       };
@@ -421,6 +425,7 @@ async function fetchHotFacts(
       dryRun: false,
       remote, // false only when include_private explicitly widened the pack
       sourceId: opts.sourceId,
+      localFederatedSourceIds: opts.sourceIds,
       sessionId: opts.sessionId,
       takesHoldersAllowList: ['world'],
     };

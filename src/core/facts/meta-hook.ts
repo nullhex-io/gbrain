@@ -5,7 +5,8 @@
  *
  *   - Best-effort: own try/catch in the dispatcher; any error here degrades
  *     to no-_meta rather than failing the tool call.
- *   - Cache key is (source_id, session_id, hash(takesHoldersAllowList sorted)).
+ *   - Cache key is (resolved source span, trust/visibility tier, session_id,
+ *     hash(takesHoldersAllowList sorted)).
  *     Visibility-aware: cache entries don't bleed across token tiers.
  *   - 30s TTL per session. Refreshed on extraction event via `bumpCache`.
  *   - Cap at top-K facts per response so the injection stays lean.
@@ -16,6 +17,8 @@
 
 import type { OperationContext } from './../operations.ts';
 import type { FactRow } from './../engine.ts';
+import { sourceScopeOpts } from '../ops/context.ts';
+import { ALL_SOURCES } from '../source-id.ts';
 import { effectiveConfidence } from './decay.ts';
 
 const DEFAULT_TTL_MS = 30_000;
@@ -72,6 +75,11 @@ export async function getBrainHotMemoryMeta(
   if (name === 'recall' || name === 'extract_facts' || name === 'forget_fact') return undefined;
 
   const sourceId = ctx.sourceId ?? 'default';
+  const scope = sourceScopeOpts(ctx);
+  const sourceIds = canonicalFactSources(scope, sourceId);
+  // A remote literal sentinel without a transport-issued list must fail closed
+  // rather than query a synthetic source named `__all__`.
+  if (sourceIds.length === 0) return undefined;
   // CX2-11: session identity is the TYPED OperationContext.sessionId field,
   // set from MCP `_meta.session_id` at the dispatch boundary. The old ad-hoc
   // `source_session` read is kept as a fallback for legacy embedders, but no
@@ -87,10 +95,11 @@ export async function getBrainHotMemoryMeta(
   // the same source+session+allowList is SERVED the private payload — a
   // cross-tier leak through the cache, not through the query.
   const tier = ctx.remote === false ? 'all' : 'world';
-  // encodeCacheField (F5): source_id / session_id are caller-controlled and
+  // encodeCacheField (F5): source ids / session_id are caller-controlled and
   // may contain the '::' delimiter; percent-encode ':' so bumpHotMemoryCache's
   // split('::') can never mis-slice a component.
-  const cacheKey = `${encodeCacheField(sourceId)}::${tier}::${encodeCacheField(sessionId ?? '_')}::${allowListHash}`;
+  const sourceScopeKey = sourceIds.map(encodeCacheField).join('|');
+  const cacheKey = `${sourceScopeKey}::${tier}::${encodeCacheField(sessionId ?? '_')}::${allowListHash}`;
 
   const ttl = Math.max(1000, opts.ttlMs ?? DEFAULT_TTL_MS);
   const topK = Math.max(1, Math.min(opts.topK ?? DEFAULT_TOP_K, 25));
@@ -109,18 +118,23 @@ export async function getBrainHotMemoryMeta(
   // local → all rows.
   const visibility = ctx.remote === false ? undefined : ['world'] as ('world' | 'private')[];
 
-  let rows: FactRow[] = [];
-  if (sessionId) {
-    rows = await ctx.engine.listFactsBySession(sourceId, sessionId, {
-      activeOnly: true, limit: topK, visibility,
-    });
-  }
-  // If no session-scoped rows, fall back to recent across the source.
-  if (rows.length === 0) {
-    rows = await ctx.engine.listFactsSince(sourceId, new Date(Date.now() - 24 * 60 * 60 * 1000), {
-      activeOnly: true, limit: topK, visibility,
-    });
-  }
+  const since = new Date(Date.now() - 24 * 60 * 60 * 1000);
+  const rows = (await Promise.all(sourceIds.map(async (id) => {
+    let sourceRows: FactRow[] = [];
+    if (sessionId) {
+      sourceRows = await ctx.engine.listFactsBySession(id, sessionId, {
+        activeOnly: true, limit: topK, visibility,
+      });
+    }
+    // Session fallback is per source so a session row in one source cannot
+    // suppress the ambient read span's recent facts from another.
+    if (sourceRows.length === 0) {
+      sourceRows = await ctx.engine.listFactsSince(id, since, {
+        activeOnly: true, limit: topK, visibility,
+      });
+    }
+    return sourceRows;
+  }))).flat();
   if (rows.length === 0) {
     cacheSet(cacheKey, { expiresAt: Date.now() + ttl, payload: undefined });
     return undefined;
@@ -128,14 +142,18 @@ export async function getBrainHotMemoryMeta(
 
   // Sort by effective confidence (decayed) before truncating.
   const now = new Date();
-  rows.sort((a, b) => effectiveConfidence(b, now) - effectiveConfidence(a, now));
-  rows = rows.slice(0, topK);
+  rows.sort((a, b) =>
+    effectiveConfidence(b, now) - effectiveConfidence(a, now)
+    || a.source_id.localeCompare(b.source_id)
+    || a.id - b.id,
+  );
+  const limitedRows = rows.slice(0, topK);
 
   const payload = {
     brain_hot_memory: {
       source_id: sourceId,
       session_id: sessionId,
-      facts: rows.map(r => ({
+      facts: limitedRows.map(r => ({
         id: r.id,
         fact: r.fact,
         kind: r.kind,
@@ -160,14 +178,14 @@ export async function getBrainHotMemoryMeta(
 export function bumpHotMemoryCache(sourceId: string, sessionId: string | null): void {
   // Walk the cache and prune any entry matching this source+session
   // (regardless of visibility tier or allow-list hash — key layout is
-  // encField(source)::tier::encField(session)::allowHash since v0.45.7).
+  // encField(source)|...::tier::encField(session)::allowHash).
   // Components are ':'-encoded, so split('::') slices cleanly even when the
   // source/session id itself contains '::' (F5).
   const encSource = encodeCacheField(sourceId);
   const encSession = encodeCacheField(sessionId ?? '_');
   for (const k of _cache.keys()) {
     const parts = k.split('::');
-    if (parts[0] === encSource && parts[2] === encSession) _cache.delete(k);
+    if (parts[0]?.split('|').includes(encSource) && parts[2] === encSession) _cache.delete(k);
   }
 }
 
@@ -175,6 +193,20 @@ export function bumpHotMemoryCache(sourceId: string, sessionId: string | null): 
  * delimiter (F5). Cheap, reversible, and keeps keys human-readable. */
 function encodeCacheField(v: string): string {
   return v.replace(/:/g, '%3A');
+}
+
+function canonicalFactSources(
+  scope: ReturnType<typeof sourceScopeOpts>,
+  sourceId: string,
+): string[] {
+  const ids = scope.sourceIds?.length
+    ? scope.sourceIds
+    : scope.sourceId && scope.sourceId !== ALL_SOURCES
+      ? [scope.sourceId]
+      : sourceId !== ALL_SOURCES
+        ? [sourceId]
+        : [];
+  return [...new Set(ids)].sort((a, b) => a.localeCompare(b));
 }
 
 /** Test helper: clear the cache. */

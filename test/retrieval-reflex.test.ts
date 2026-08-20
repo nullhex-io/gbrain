@@ -9,12 +9,13 @@
  */
 import { describe, test, expect, beforeAll, afterAll, beforeEach } from 'bun:test';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
+import type { BrainEngine } from '../src/core/engine.ts';
 import { withEnv } from './helpers/with-env.ts';
 import { normalizeAlias } from '../src/core/search/alias-normalize.ts';
 import { resolveEntitiesToPointers } from '../src/core/context/retrieval-reflex.ts';
 import { extractCandidates } from '../src/core/context/entity-salience.ts';
 import { createGBrainContextEngine } from '../src/core/context-engine.ts';
-import { disposeReflex, lexicalArmsEnabled } from '../src/core/context/reflex.ts';
+import { disposeReflex, lexicalArmsEnabled, resolveDirectReflexSourceScope } from '../src/core/context/reflex.ts';
 import { TAKES_FENCE_BEGIN, TAKES_FENCE_END } from '../src/core/takes-fence.ts';
 
 let engine: PGLiteEngine;
@@ -41,6 +42,66 @@ afterAll(async () => {
 beforeEach(async () => {
   await engine.executeRaw('DELETE FROM page_aliases').catch(() => {});
   await engine.executeRaw('DELETE FROM pages');
+});
+
+describe('direct reflex source scope', () => {
+  test('expands ambient __all__ to explicit active source ids and never forwards the sentinel', async () => {
+    const queries: string[] = [];
+    const direct = {
+      executeRaw: async (sql: string) => {
+        queries.push(sql);
+        return [
+          { id: 'default', archived: false },
+          { id: 'research', archived: false },
+        ];
+      },
+    } as unknown as BrainEngine;
+
+    const scope = await withEnv({ GBRAIN_SOURCE: '__all__' }, () =>
+      resolveDirectReflexSourceScope(direct, process.cwd()),
+    );
+
+    expect(scope).toEqual({ sourceId: 'default', sourceIds: ['default', 'research'] });
+    expect(scope?.sourceIds).not.toContain('__all__');
+    expect(queries).toHaveLength(1);
+  });
+
+  test('fails closed and visibly when ambient source enumeration fails', async () => {
+    const direct = {
+      executeRaw: async () => { throw new Error('source table unavailable'); },
+    } as unknown as BrainEngine;
+    const messages: string[] = [];
+    const originalWrite = process.stderr.write.bind(process.stderr);
+    (process.stderr as unknown as { write: (chunk: string) => boolean }).write = (chunk) => {
+      messages.push(String(chunk));
+      return true;
+    };
+    try {
+      const scope = await withEnv({ GBRAIN_SOURCE: '__all__' }, () =>
+        resolveDirectReflexSourceScope(direct, process.cwd()),
+      );
+      expect(scope).toBeNull();
+      expect(messages.join('')).toContain('source enumeration failed');
+    } finally {
+      (process.stderr as unknown as { write: unknown }).write = originalWrite;
+    }
+  });
+
+  test('preserves a concrete direct reflex source without all-source enumeration', async () => {
+    const queries: string[] = [];
+    const direct = {
+      executeRaw: async (sql: string) => {
+        queries.push(sql);
+        if (/WHERE id = \$1/.test(sql)) return [{ id: 'research' }];
+        throw new Error('concrete source must not enumerate');
+      },
+    } as unknown as BrainEngine;
+    const scope = await withEnv({ GBRAIN_SOURCE: 'research' }, () =>
+      resolveDirectReflexSourceScope(direct, process.cwd()),
+    );
+    expect(scope).toEqual({ sourceId: 'research' });
+    expect(queries).toHaveLength(1);
+  });
 });
 
 describe('resolveEntitiesToPointers', () => {

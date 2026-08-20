@@ -16,6 +16,7 @@
 import { readFileSync, existsSync, statSync } from 'fs';
 import { join } from 'path';
 import { buildReflexAddition, warmReflex, type ResolveEntitiesFn as ReflexResolveEntitiesFn } from './context/reflex.ts';
+import { ALL_SOURCES } from './source-id.ts';
 // Types inlined from openclaw/plugin-sdk to avoid hard dependency during development.
 // At runtime inside OpenClaw, the real SDK is available; these types ensure build compat.
 
@@ -778,6 +779,18 @@ export function sanitizeEngineSessionId(raw: unknown): string | null {
   return s && !/^\.+$/.test(s) ? s : null;
 }
 
+/** Reject the read-only ambient sentinel before scalar session state or files. */
+async function requireBoundContextSource(sourceId: string): Promise<string> {
+  if (sourceId !== ALL_SOURCES) return sourceId;
+  process.stderr.write('[gbrain] context engine source_binding_required: __all__ cannot bind session or checkpoint state.\n');
+  const { OperationError } = await import('./ops/contract.ts');
+  throw new OperationError(
+    'source_binding_required',
+    'The context engine needs one concrete source for session and checkpoint state.',
+    'Set GBRAIN_SOURCE to one concrete source before using direct Postgres context compaction.',
+  );
+}
+
 // ── Engine Implementation ───────────────────────────────────────────────
 
 export function createGBrainContextEngine(ctx: {
@@ -862,7 +875,9 @@ export function createGBrainContextEngine(ctx: {
         const pg = await getDirectPostgresEngine(cfg);
         if (!pg) return null;
         const { resolveSourceId } = await import('./source-resolver.ts');
-        const sourceId = await resolveSourceId(pg, null, workspaceDir);
+        const sourceId = await requireBoundContextSource(
+          await resolveSourceId(pg, null, workspaceDir),
+        );
         const ss = await import('./context/session-state.ts');
         return await ss.getCheckpointManifest(pg, sourceId, null, sessionId);
       } catch {
@@ -926,6 +941,17 @@ export function createGBrainContextEngine(ctx: {
     // structurally: a non-JSONL/boundary-less file is a typed skip below.
     const sessionFile = typeof params.sessionFile === 'string' && params.sessionFile ? params.sessionFile : null;
     if (!sessionId || !sessionFile) return { status: 'skipped', reason: 'no_session' };
+    // The ambient sentinel is a read capability only. Fence it before even
+    // preparing the corpus spool, so it cannot create direct-path state when
+    // a database is unavailable or a future ladder branch changes ordering.
+    try {
+      await requireBoundContextSource(process.env.GBRAIN_SOURCE ?? '');
+    } catch (error) {
+      if (error instanceof Error && (error as { code?: string }).code === 'source_binding_required') {
+        return { status: 'skipped', reason: 'source_binding_required' };
+      }
+      throw error;
+    }
 
     const segs = await import('./context/corpus-segments.ts');
     if (deadlineHit()) return { status: 'skipped', reason: 'deadline' };
@@ -939,9 +965,31 @@ export function createGBrainContextEngine(ctx: {
     if (!rendered) return { status: 'skipped', reason: 'scan_unavailable' };
     if (!rendered.text.trim()) return { status: 'skipped', reason: 'empty_window' };
 
-    // Spool FIRST (durability is engine-independent; the sweep is the backstop).
     const { loadConfig } = await import('./config.ts');
     const cfg = loadConfig();
+    // On direct Postgres, source binding must be checked before the spool
+    // creates a segment/ledger or any later claim, sidecar, or session state.
+    let directPg: import('./engine.ts').BrainEngine | null = null;
+    let directSourceId: string | null = null;
+    if (!(cfg?.engine === 'pglite' && cfg.database_path)) {
+      const { getDirectPostgresEngine } = await import('./context/reflex.ts');
+      directPg = await getDirectPostgresEngine(cfg);
+      if (directPg) {
+        const { resolveSourceId } = await import('./source-resolver.ts');
+        try {
+          directSourceId = await requireBoundContextSource(
+            await resolveSourceId(directPg, null, workspaceDir),
+          );
+        } catch (error) {
+          if (error instanceof Error && (error as { code?: string }).code === 'source_binding_required') {
+            return { status: 'skipped', reason: 'source_binding_required' };
+          }
+          throw error;
+        }
+      }
+    }
+
+    // Spool FIRST only after the direct stateful source binding is known.
     const dir = await engineCorpusDir(cfg);
     const w = segs.writeSegment(dir, sessionId, rendered.text);
     const ordinal = segs.appendSegmentLedger(dir, sessionId, w.hash);
@@ -975,7 +1023,7 @@ export function createGBrainContextEngine(ctx: {
     // Rung 3 — Postgres: inline harvest over the ladder's cached connection,
     // under the SAME claim fencing + gates as the serve FIFO/sweep.
     const { getDirectPostgresEngine } = await import('./context/reflex.ts');
-    const pg = await getDirectPostgresEngine(cfg);
+    const pg = directPg ?? await getDirectPostgresEngine(cfg);
     if (!pg) return { status: 'banked', reason: 'no_engine' };
     const sweep = await import('./sweep.ts');
     const fullPath = `${dir}/${segs.segmentFileName(sessionId, w.hash)}`;
@@ -994,8 +1042,9 @@ export function createGBrainContextEngine(ctx: {
       if (!detectCapabilities().extraction.available) return { status: 'banked', reason: 'keyless' };
       const { isFactsExtractionEnabled } = await import('./facts/extract.ts');
       if (!(await isFactsExtractionEnabled(pg))) return { status: 'banked', reason: 'extraction_disabled' };
-      const { resolveSourceId } = await import('./source-resolver.ts');
-      const sourceId = await resolveSourceId(pg, null, workspaceDir);
+      const resolvedSourceId = await (await import('./source-resolver.ts'))
+        .resolveSourceId(pg, null, workspaceDir);
+      const sourceId = directSourceId ?? await requireBoundContextSource(resolvedSourceId);
       if (deadlineHit()) return { status: 'banked', reason: 'deadline' };
       const { runFactsPipeline } = await import('./facts/backstop.ts');
       const abort = new AbortController();

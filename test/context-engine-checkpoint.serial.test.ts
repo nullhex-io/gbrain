@@ -26,11 +26,14 @@ describe('checkpoint compaction (cathedral 5)', () => {
   const { existsSync, readdirSync, readFileSync } = require('node:fs') as typeof import('node:fs');
   let home: string | undefined;
   let savedHome: string | undefined;
+  let savedSource: string | undefined;
   let servers: Array<{ close: () => void }> = [];
 
   beforeEach(() => {
     __resetSdkLoadStateForTests();
     savedHome = process.env.GBRAIN_HOME;
+    savedSource = process.env.GBRAIN_SOURCE;
+    delete process.env.GBRAIN_SOURCE;
     home = mkdtempSync(join(tmpdir(), 'gb-ce-ckpt-'));
     process.env.GBRAIN_HOME = home;
   });
@@ -40,6 +43,8 @@ describe('checkpoint compaction (cathedral 5)', () => {
     servers = [];
     if (savedHome === undefined) delete process.env.GBRAIN_HOME;
     else process.env.GBRAIN_HOME = savedHome;
+    if (savedSource === undefined) delete process.env.GBRAIN_SOURCE;
+    else process.env.GBRAIN_SOURCE = savedSource;
     if (home) rmSync(home, { recursive: true, force: true });
     home = undefined;
     if (tmpDir) rmSync(tmpDir, { recursive: true, force: true });
@@ -72,6 +77,18 @@ describe('checkpoint compaction (cathedral 5)', () => {
     const ledger = JSON.parse(readFileSync(join(corpus, 'oc-sess.ledger.json'), 'utf8')) as Array<{ hash: string }>;
     expect(ledger).toHaveLength(1);
     expect(segs[0]).toContain(ledger[0].hash);
+  });
+
+  it('rejects ambient __all__ before creating a corpus segment or ledger', async () => {
+    tmpDir = makeWorkspace();
+    process.env.GBRAIN_SOURCE = '__all__';
+    const sessionFile = join(home!, 'oc-all.jsonl');
+    writeFileSync(sessionFile, [sessionLine, msg('must not be spooled')].join('\n') + '\n');
+    const engine = createGBrainContextEngine({ workspaceDir: tmpDir });
+    const result = await engine.compact({ sessionId: 'oc-all', sessionFile });
+    const bag = (result.result ?? {}) as { gbrain_checkpoint?: { status: string; reason?: string } };
+    expect(bag.gbrain_checkpoint).toEqual({ status: 'skipped', reason: 'source_binding_required' });
+    expect(existsSync(join(home!, '.gbrain', 'transcripts', 'corpus'))).toBe(false);
   });
 
   it('CK2: no-prior-boundary fallback caps the window at the newest 40 turns', async () => {

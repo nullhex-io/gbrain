@@ -29,10 +29,21 @@ import { ALL_SOURCES } from '../core/source-id.ts';
 import { loadAllSources } from '../core/sources-load.ts';
 import { allSourcesWriteFenceError } from '../core/ops/context.ts';
 
+export interface McpStdioSourceScope {
+  sourceId: string;
+  /** Server-issued only. Never derived from an MCP request. */
+  localFederatedSourceIds?: string[];
+  tier: import('../core/source-resolver.ts').SourceTier;
+}
+
+function canonicalSourceIds(sourceIds: readonly string[]): string[] {
+  return [...new Set(sourceIds)].sort((a, b) => a.localeCompare(b));
+}
+
 export async function resolveMcpStdioSourceScope(
   engine: BrainEngine,
   cwd: string = process.cwd(),
-): Promise<{ sourceId: string; localFederatedSourceIds?: string[]; tier: import('../core/source-resolver.ts').SourceTier }> {
+): Promise<McpStdioSourceScope> {
   let resolved: { source_id: string; tier: import('../core/source-resolver.ts').SourceTier };
   try {
     const { resolveSourceWithTier } = await import('../core/source-resolver.ts');
@@ -54,28 +65,30 @@ export async function resolveMcpStdioSourceScope(
       : { sourceId: 'default', tier: 'seed_default' };
   }
 
-  try {
-    if (resolved.source_id === ALL_SOURCES) {
-      // GBRAIN_SOURCE=__all__ is an explicit trusted-operator capability, not
-      // a source binding. Issue every active source, including isolated ones.
-      // A per-call __all__ on ordinary grantless stdio remains limited to the
-      // transport-computed federated set in context.ts. On failure omit this
-      // capability so reads fail closed; dispatch still sees the sentinel and
-      // blocks every write/admin or mutating operation.
-      const activeSources = await loadAllSources(engine);
-      const localFederatedSourceIds = activeSources.map((source) => source.id);
-      return {
-        sourceId: resolved.source_id,
-        ...(localFederatedSourceIds.length > 0 ? { localFederatedSourceIds } : {}),
-        tier: resolved.tier,
-      };
+  if (resolved.source_id === ALL_SOURCES) {
+    // GBRAIN_SOURCE=__all__ is an explicit trusted-operator capability, not a
+    // source binding. Issue every active source, including isolated ones. An
+    // enumeration failure must remain visible: omitting the list would turn an
+    // ambient read into a literal sentinel query or an empty-success response.
+    let activeSources;
+    try {
+      activeSources = await loadAllSources(engine);
+    } catch (cause) {
+      throw new Error('Unable to enumerate active sources for GBRAIN_SOURCE=__all__', { cause });
     }
+    const localFederatedSourceIds = canonicalSourceIds(activeSources.map((source) => source.id));
+    if (localFederatedSourceIds.length === 0) {
+      throw new Error('Unable to enumerate active sources for GBRAIN_SOURCE=__all__: none found');
+    }
+    return { sourceId: resolved.source_id, localFederatedSourceIds, tier: resolved.tier };
+  }
 
+  try {
     const { localFederatedSourceIds } = await import('../core/source-resolver.ts');
     const federated = await localFederatedSourceIds(engine, resolved.source_id, resolved.tier);
     return {
       sourceId: resolved.source_id,
-      ...(federated ? { localFederatedSourceIds: federated } : {}),
+      ...(federated ? { localFederatedSourceIds: canonicalSourceIds(federated) } : {}),
       tier: resolved.tier,
     };
   } catch {
@@ -84,6 +97,70 @@ export async function resolveMcpStdioSourceScope(
     // transient failure: that would re-open the write route below.
     return { sourceId: resolved.source_id, tier: resolved.tier };
   }
+}
+
+/** Stateful startup maintenance is never scheduled against an ambient span. */
+export function shouldArmStartupSweep(sourceId: string): boolean {
+  return sourceId !== ALL_SOURCES;
+}
+
+/**
+ * Build the PGLite IPC surface from a server-issued source scope. Ambient
+ * `__all__` may expose only stateless read handlers; scalar/session/write
+ * handlers remain absent so the protocol returns `unsupported_kind`.
+ */
+export async function buildPgliteIpcHandlers(
+  engine: BrainEngine,
+  scope: McpStdioSourceScope,
+): Promise<IpcHandlers> {
+  const sourceId = scope.sourceId;
+  const sourceIds = scope.localFederatedSourceIds
+    ? canonicalSourceIds(scope.localFederatedSourceIds)
+    : undefined;
+  const handlers: IpcHandlers = {
+    resolve: (req) =>
+      resolveEntitiesToPointers(engine, sourceId, req.candidates ?? [], {
+        priorContextText: req.priorContextText,
+        maxPointers: req.maxPointers,
+        suppression: req.suppression,
+        sourceIds,
+        // Per-request config read: a false client value wins, otherwise a
+        // running serve picks up the file-plane switch on the next turn.
+        lexicalArms: req.lexicalArms === false ? false : lexicalArmsEnabled(loadConfig()),
+      }),
+    turn_context: (req) =>
+      assembleTurnContext(engine, {
+        sourceId,
+        sourceIds,
+        window: req.window ?? [],
+        priorContextText: req.priorContextText,
+        sessionId: req.sessionId,
+        maxBytes: req.maxBytes,
+        lexicalArms: lexicalArmsEnabled(loadConfig()),
+      }),
+  };
+
+  // context_pack carries scalar session/checkpoint state. Do not choose a
+  // source or widen its wire contract under an ambient read span.
+  if (sourceId === ALL_SOURCES) return handlers;
+  handlers.context_pack = makeContextPackIpcHandler(engine, sourceId);
+
+  // Sync mutates derived/source state and stays behind the universal sentinel
+  // write fence. Unregistered means a client receives `unsupported_kind`.
+  if (process.env.GBRAIN_SERVE_SYNC_IPC !== '0') {
+    try {
+      const runner = await import('../core/serve-sync-runner.ts');
+      handlers.sync_start = (req) =>
+        runner.startDelegatedSync(engine, req.options, req.clientToken, { boundSourceId: sourceId });
+      handlers.sync_status = (req) => runner.getDelegatedSyncStatus(req.jobId);
+      handlers.sync_abort = (req) => runner.abortDelegatedSync(req.jobId);
+    } catch (e) {
+      process.stderr.write(
+        `[serve-sync] handlers unavailable: ${e instanceof Error ? e.message : String(e)}\n`,
+      );
+    }
+  }
+  return handlers;
 }
 
 /**
@@ -217,7 +294,8 @@ export async function startMcpServer(engine: BrainEngine, opts: { surface?: McpS
     const cfg = loadConfig();
     if (cfg?.engine === 'pglite' && cfg.database_path) {
       resolveSocket = resolveSocketPath(cfg.database_path);
-      const { sourceId: defaultSource } = await resolveMcpStdioSourceScope(engine);
+      const sourceScope = await resolveMcpStdioSourceScope(engine);
+      const defaultSource = sourceScope.sourceId;
       // [S3#6] turn_context requires the shared secret from the data dir
       // (created 0600 here if absent). If the secret can't be provisioned,
       // turn_context stays fail-closed ('unauthorized') while the secret-free
@@ -226,80 +304,9 @@ export async function startMcpServer(engine: BrainEngine, opts: { surface?: McpS
       try {
         ipcSecret = ensureIpcSecret(cfg.database_path);
       } catch { /* turn_context disabled; resolve unaffected */ }
-      // Serve-delegated sync kinds — built in their OWN try/catch so a
-      // runner import/registration failure can never take resolve /
-      // turn_context / context_pack down with it (this whole block's shared
-      // catch would otherwise swallow the error and start NO listener).
-      // Kill switch: GBRAIN_SERVE_SYNC_IPC=0 → the kinds are simply not
-      // registered and clients get 'unsupported_kind' (the polite refusal).
-      let syncHandlers: Pick<IpcHandlers, 'sync_start' | 'sync_status' | 'sync_abort'> = {};
-      if (process.env.GBRAIN_SERVE_SYNC_IPC !== '0') {
-        try {
-          const runner = await import('../core/serve-sync-runner.ts');
-          syncHandlers = {
-            sync_start: (req) =>
-              runner.startDelegatedSync(engine, req.options, req.clientToken, {
-                boundSourceId: defaultSource,
-              }),
-            sync_status: (req) => runner.getDelegatedSyncStatus(req.jobId),
-            sync_abort: (req) => runner.abortDelegatedSync(req.jobId),
-          };
-        } catch (e) {
-          process.stderr.write(
-            `[serve-sync] handlers unavailable: ${e instanceof Error ? e.message : String(e)}\n`,
-          );
-        }
-      }
       resolveServer = await startResolveIpcServer(
         resolveSocket,
-        {
-          // [CX2-10] Bound-source posture for BOTH kinds: the IPC layer
-          // rejects any resolve/turn_context request naming a source other
-          // than boundSourceId ('source_mismatch'), so the only sourceId that
-          // reaches this handler is the bound one or absent — and the handler
-          // resolves against the server's OWN registered source regardless.
-          resolve: (req) =>
-            resolveEntitiesToPointers(
-              engine,
-              defaultSource,
-              req.candidates ?? [],
-              {
-                priorContextText: req.priorContextText,
-                maxPointers: req.maxPointers,
-                suppression: req.suppression,
-                // v0.46.15 kill switch: either side may disable — a client
-                // `false` wins, else the server's own file-config gate.
-                // Config is re-read PER REQUEST (adversarial F3): `gbrain
-                // serve` is long-running, and the switch's whole value is
-                // reverting a false-fire regression on the NEXT TURN with a
-                // config edit — a startup snapshot would freeze it until a
-                // serve restart. loadConfig is a file read (~1ms) inside the
-                // 400ms IPC budget.
-                lexicalArms: req.lexicalArms === false ? false : lexicalArmsEnabled(loadConfig()),
-              },
-            ),
-          // IPC v2 [ENG-3]: per-turn context assembly for the hook command.
-          // [CX2-10] Always assembles against the server's OWN registered
-          // source — cross-source requests are rejected in the IPC layer via
-          // boundSourceId below, and the handler never honors a caller source.
-          turn_context: (req) =>
-            assembleTurnContext(engine, {
-              sourceId: defaultSource,
-              window: req.window ?? [],
-              priorContextText: req.priorContextText,
-              sessionId: req.sessionId,
-              maxBytes: req.maxBytes,
-              // Per-request config read — same next-turn-revert rationale as
-              // the resolve handler above (adversarial F3).
-              lexicalArms: lexicalArmsEnabled(loadConfig()),
-            }),
-          // v0.45.7 ambient recall: boundary context pack. Extracted to
-          // context-pack-handler.ts (directly testable against a real engine);
-          // the runtime owns entity merge, banking, the since-cursor, and the
-          // complete-pack-only monotonic cursor advance.
-          context_pack: makeContextPackIpcHandler(engine, defaultSource),
-          ...syncHandlers,
-        },
+        await buildPgliteIpcHandlers(engine, sourceScope),
         {
           // The IPC resolve path IS the ambient reflex channel. Logging happens
           // at DELIVERY (post-write), not inside the resolver — a block the
@@ -318,8 +325,10 @@ export async function startMcpServer(engine: BrainEngine, opts: { surface?: McpS
         },
       );
     }
-  } catch {
-    /* resolve IPC is best-effort; never block serve */
+  } catch (e) {
+    process.stderr.write(
+      `[gbrain-serve] resolve IPC unavailable: ${e instanceof Error ? e.message : String(e)}\n`,
+    );
   }
 
   // v0.45.7 ambient recall: age out stale session cursors once per serve boot
@@ -335,11 +344,11 @@ export async function startMcpServer(engine: BrainEngine, opts: { surface?: McpS
   // inside the helper). Lazy import keeps sweep code off the boot path.
   let startupSweep: { cancel: () => void } | null = null;
   try {
-    const { armStartupSweep } = await import('../core/sweep.ts');
     const { sourceId } = await resolveMcpStdioSourceScope(engine);
-    startupSweep = armStartupSweep(engine, {
-      sourceId,
-    });
+    if (shouldArmStartupSweep(sourceId)) {
+      const { armStartupSweep } = await import('../core/sweep.ts');
+      startupSweep = armStartupSweep(engine, { sourceId });
+    }
   } catch {
     /* startup sweep is best-effort; never block serve */
   }

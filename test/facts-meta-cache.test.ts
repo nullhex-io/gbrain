@@ -186,6 +186,42 @@ describe('meta-hook cache', () => {
     const emptyCount = (emptyList?.brain_hot_memory as { facts: unknown[] } | undefined)?.facts.length ?? 0;
     expect(emptyCount).toBeGreaterThan(unsetCount);
   });
+
+  test('federates server-issued sources without querying literal __all__ and isolates cache scope', async () => {
+    const alpha = 'meta-alpha';
+    const beta = 'meta-beta';
+    for (const sourceId of [alpha, beta]) {
+      await engine.executeRaw(
+        `INSERT INTO sources (id, name, config) VALUES ($1, $1, '{}'::jsonb) ON CONFLICT (id) DO NOTHING`,
+        [sourceId],
+      );
+      await engine.insertFact(
+        { fact: `meta fact from ${sourceId}`, kind: 'fact', entity_slug: 'meta-scope', visibility: 'world', source: 'test' },
+        { source_id: sourceId },
+      );
+    }
+    const ambient = ctx({
+      remote: true,
+      sourceId: '__all__',
+      localFederatedSourceIds: [beta, alpha, beta],
+    });
+    const first = await getBrainHotMemoryMeta('get_stats', ambient);
+    const facts = (first?.brain_hot_memory as { facts: Array<{ fact: string }> }).facts.map((f) => f.fact);
+    expect(facts).toContain(`meta fact from ${alpha}`);
+    expect(facts).toContain(`meta fact from ${beta}`);
+
+    await engine.insertFact(
+      { fact: 'meta fact only beta after warm', kind: 'fact', entity_slug: 'meta-scope', visibility: 'world', source: 'test' },
+      { source_id: beta },
+    );
+    const alphaOnly = await getBrainHotMemoryMeta('get_stats', ctx({
+      remote: true,
+      sourceId: '__all__',
+      localFederatedSourceIds: [alpha],
+    }));
+    const alphaFacts = (alphaOnly?.brain_hot_memory as { facts: Array<{ fact: string }> }).facts.map((f) => f.fact);
+    expect(alphaFacts).not.toContain('meta fact only beta after warm');
+  });
 });
 
 describe('meta-hook cache hygiene (bounded, expired-entry eviction)', () => {

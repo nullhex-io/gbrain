@@ -94,6 +94,8 @@ import { assertFactsEmbeddingDimMatchesConfig } from '../core/embedding-dim-chec
 import { writeReceipt, shortRunId } from '../core/extract/receipt-writer.ts';
 import { upsertExtractRollup } from '../core/extract/rollup-writer.ts';
 import { ALLOWED_TYPES, type AllowedType } from '../core/facts/conversation-types.ts';
+import { ALL_SOURCES } from '../core/source-id.ts';
+import { OperationError } from '../core/ops/contract.ts';
 
 // Re-exported verbatim so existing importers (this file's own helpers below
 // and this file's tests) keep working unchanged; doctor.ts, jobs.ts,
@@ -1240,10 +1242,8 @@ export async function runExtractConversationFactsCore(
   signal?: AbortSignal,
 ): Promise<ExtractConversationFactsResult> {
   const sourceId = opts.sourceId;
-  if (!sourceId) {
-    throw new Error('runExtractConversationFactsCore: opts.sourceId is required');
-  }
-
+  if (!sourceId) throw new Error('runExtractConversationFactsCore: opts.sourceId is required');
+  assertConversationFactsSourceBinding(sourceId);
   const result: ExtractConversationFactsResult = {
     pages_considered: 0,
     pages_processed: 0,
@@ -1594,6 +1594,9 @@ export async function runExtractConversationFactsCore(
 
   return result;
 }
+export function assertConversationFactsSourceBinding(sourceId: string | undefined): void {
+  if (sourceId === ALL_SOURCES) throw new OperationError('source_binding_required', 'extract-conversation-facts requires one concrete source; __all__ is read-only.', 'Omit --source-id to fan out over active sources, or pass one concrete source id.');
+}
 
 /**
  * v0.42 — Wave B1: best-effort receipt + rollup writes at the end of an
@@ -1820,6 +1823,7 @@ conversation_facts_backlog check counts pages without this row.
 
 function buildJobParams(args: string[]): Record<string, unknown> {
   const parsed = parseArgs(args);
+  assertConversationFactsSourceBinding(parsed.sourceId);
   return {
     sourceId: parsed.sourceId,
     types: parsed.types,
@@ -1849,6 +1853,8 @@ export async function runExtractConversationFacts(
     console.log(HELP);
     return;
   }
+
+  assertConversationFactsSourceBinding(parseArgs(args).sourceId);
 
   // --background path.
   const backgrounded = await maybeBackground({

@@ -17,6 +17,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { withEnv } from './helpers/with-env.ts';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
+import type { BrainEngine } from '../src/core/engine.ts';
 import {
   __setChatTransportForTests,
   __setEmbedTransportForTests,
@@ -319,6 +320,22 @@ const SAMPLE_BODY = [
 ].join('\n');
 
 describe('runExtractConversationFactsCore', () => {
+  test('rejects __all__ before touching checkpoint, rollup, lock, page, or LLM paths', async () => {
+    const touches: string[] = [];
+    const forbiddenEngine = new Proxy({}, {
+      get(_target, property) {
+        touches.push(String(property));
+        throw new Error(`unexpected engine touch: ${String(property)}`);
+      },
+    }) as unknown as BrainEngine;
+
+    await expect(runExtractConversationFactsCore(forbiddenEngine, {
+      sourceId: '__all__',
+      dryRun: true,
+    })).rejects.toMatchObject({ code: 'source_binding_required' });
+    expect(touches).toEqual([]);
+  });
+
   let engine: PGLiteEngine;
   let repoDir: string;
   let chatFailure: Error | null = null;

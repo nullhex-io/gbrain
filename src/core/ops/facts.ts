@@ -157,16 +157,21 @@ const recall: Operation = {
     // default — via sourceScopeOpts, never a hand-rolled filter. The engine
     // fact APIs are scalar-source, so a federated grant fans out per granted
     // source and merges newest-first; a single-source caller takes exactly
-    // the pre-v1 single-query path. A trusted-local `__all__` ({}) has no
-    // enumerable grant and keeps the resolved-scalar behavior.
+    // the pre-v1 single-query path. A trusted-local `__all__` enumerates
+    // active sources here because the fact APIs are scalar-source.
     const scope = sourceScopeOpts(ctx);
     // Set-dedupe: a grant carrying a repeated id (or the scalar source again)
     // must not fan out the same source twice into the merge.
-    const factSources: string[] = [...new Set(
+    let factSources: string[] = [...new Set(
       scope.sourceIds && scope.sourceIds.length > 0 ? scope.sourceIds
         : scope.sourceId ? [scope.sourceId]
           : [sourceId],
-    )];
+    )].sort((a, b) => a.localeCompare(b));
+    if (ctx.remote === false && sourceId === '__all__' && !scope.sourceIds && !scope.sourceId) {
+      const { loadAllSources } = await import('../sources-load.ts');
+      factSources = [...new Set((await loadAllSources(ctx.engine)).map((source) => source.id))]
+        .sort((a, b) => a.localeCompare(b));
+    }
 
     // Visibility filter: remote callers see world-only unless their token
     // grants elevated visibility (future-proofing; v0.31 ships world-only

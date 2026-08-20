@@ -18,6 +18,7 @@ import {
   TURN_CONTEXT_ENVELOPE,
   TURN_CONTEXT_DEFAULT_MAX_BYTES,
 } from '../src/core/context/turn-context.ts';
+import { volunteerContext } from '../src/core/context/volunteer.ts';
 import {
   getBrainHotMemoryMeta,
   bumpHotMemoryCache,
@@ -106,6 +107,45 @@ describe('assembleTurnContext', () => {
     expect(r.factsCount).toBe(1);
     expect(r.degradedReason).toBeUndefined();
     expect(Buffer.byteLength(r.text, 'utf8')).toBeLessThanOrEqual(TURN_CONTEXT_DEFAULT_MAX_BYTES);
+  });
+
+  test('uses the server-issued federated scope for pointers, volunteers, and hot facts', async () => {
+    const sourceId = 'turn-federated';
+    await engine.executeRaw(
+      `INSERT INTO sources (id, name) VALUES ($1, $1) ON CONFLICT (id) DO NOTHING`,
+      [sourceId],
+    );
+    await engine.executeRaw(
+      `INSERT INTO pages (slug, source_id, type, title, compiled_truth, timeline)
+       VALUES ('people/federated', $1, 'person', 'Federated Person', 'Federated Person profile.', '')`,
+      [sourceId],
+    );
+    await engine.insertFact(
+      {
+        fact: 'FEDERATED-TURN-HOT-FACT',
+        kind: 'fact',
+        entity_slug: 'people/federated',
+        source: 'test',
+        visibility: 'world',
+      },
+      { source_id: sourceId },
+    );
+
+    const r = await assembleTurnContext(engine, {
+      sourceId: '__all__',
+      sourceIds: ['default', sourceId],
+      window: [{ role: 'user', text: 'Please contact Federated Person' }],
+    });
+
+    expect(r.pointers.some((p) => p.source_id === sourceId && p.slug === 'people/federated')).toBe(true);
+    expect(r.text).toContain('FEDERATED-TURN-HOT-FACT');
+
+    // The assembler dedupes volunteers already carried as pointers. Exercise
+    // the volunteer arm directly to pin the same issued source span.
+    const volunteers = await volunteerContext(engine, [{ role: 'user', text: 'Please contact Federated Person' }], {
+      sourceIds: ['default', sourceId],
+    });
+    expect(volunteers.some((p) => p.source_id === sourceId && p.slug === 'people/federated')).toBe(true);
   });
 
   test('volunteer section dedupes against reflex pointers (slug appears once)', async () => {

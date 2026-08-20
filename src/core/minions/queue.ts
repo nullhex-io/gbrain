@@ -16,6 +16,7 @@ import type {
 import { rowToMinionJob, rowToInboxMessage, rowToAttachment } from './types.ts';
 import { validateAttachment } from './attachments.ts';
 import { isProtectedJobName } from './protected-names.ts';
+import { assertNoAllSourcesJobBinding } from './source-binding.ts';
 import {
   computeParamHash,
   resolveAdmissionPolicy,
@@ -47,7 +48,6 @@ export interface TrustedSubmitOpts {
 }
 
 const MIGRATION_VERSION = 7;
-
 const DEFAULT_MAX_SPAWN_DEPTH = 5;
 
 /**
@@ -183,6 +183,7 @@ export class MinionQueue {
     if (jobName.length === 0) {
       throw new Error('Job name cannot be empty');
     }
+    assertNoAllSourcesJobBinding(data);
     if (isProtectedJobName(jobName) && !trusted?.allowProtectedSubmit) {
       throw new Error(
         `protected job name '${jobName}' requires CLI or operation-local submitter ` +

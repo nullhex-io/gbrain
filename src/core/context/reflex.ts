@@ -20,6 +20,7 @@ import { join } from 'node:path';
 import { mkdirSync, appendFileSync } from 'node:fs';
 import { loadConfig, type GBrainConfig } from '../config.ts';
 import type { BrainEngine } from '../engine.ts';
+import { ALL_SOURCES } from '../source-id.ts';
 import {
   extractCandidates,
   extractCandidatesFromWindow,
@@ -196,12 +197,45 @@ async function resolve(
   if (isPostgres(cfg)) {
     const engine = await getPostgresEngine(cfg);
     if (!engine) return null;
-    const { resolveSourceId } = await import('../source-resolver.ts');
-    const sourceId = await resolveSourceId(engine, null, params.workspaceDir);
-    return resolveEntitiesToPointers(engine, sourceId, candidates, opts);
+    const scope = await resolveDirectReflexSourceScope(engine, params.workspaceDir);
+    if (!scope) return null;
+    return resolveEntitiesToPointers(
+      engine,
+      scope.sourceId,
+      candidates,
+      scope.sourceIds ? { ...opts, sourceIds: scope.sourceIds } : opts,
+    );
   }
   // 4. Disabled (PGLite with no serve / unknown engine). Policy skill carries.
   return null;
+}
+
+/**
+ * Resolve the direct-Postgres reflex read scope without ever sending the
+ * ambient read-only sentinel into the scalar resolver. `__all__` expands to
+ * the active, canonical source ids already trusted by the local sources table.
+ */
+export async function resolveDirectReflexSourceScope(
+  engine: BrainEngine,
+  workspaceDir: string,
+): Promise<{ sourceId: string; sourceIds?: string[] } | null> {
+  const { resolveSourceId } = await import('../source-resolver.ts');
+  const sourceId = await resolveSourceId(engine, null, workspaceDir);
+  if (sourceId !== ALL_SOURCES) return { sourceId };
+
+  try {
+    const { loadAllSources } = await import('../sources-load.ts');
+    const sourceIds = (await loadAllSources(engine)).map((source) => source.id);
+    if (!sourceIds.length || sourceIds.includes(ALL_SOURCES)) {
+      process.stderr.write('[gbrain] retrieval reflex source enumeration refused: no valid concrete source binding.\n');
+      return null;
+    }
+    return { sourceId: sourceIds[0], sourceIds };
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    process.stderr.write(`[gbrain] retrieval reflex source enumeration failed: ${message}\n`);
+    return null;
+  }
 }
 
 export function isPostgres(cfg: GBrainConfig | null): boolean {

@@ -18,6 +18,7 @@
 import type { BrainEngine } from '../core/engine.ts';
 import { runMaintenanceSweep, type SweepReport } from '../core/sweep.ts';
 import { setCliExitVerdict } from '../core/cli-force-exit.ts';
+import { ALL_SOURCES } from '../core/source-id.ts';
 
 export const SWEEP_HELP = `gbrain sweep — run the serve-resident maintenance sweep once, locally
 
@@ -81,6 +82,13 @@ export async function runSweep(engine: BrainEngine, args: string[]): Promise<voi
   const sourceId = sourceIdx >= 0 && args[sourceIdx + 1]
     ? args[sourceIdx + 1]
     : (process.env.GBRAIN_SOURCE || 'default');
+  if (sourceId === ALL_SOURCES) {
+    console.error(
+      'gbrain sweep [source_binding_required]: --source __all__ is read-only and cannot run maintenance. Choose one concrete source.',
+    );
+    setCliExitVerdict(2);
+    return;
+  }
 
   let budgetMs: number | undefined;
   let batchLimit: number | undefined;

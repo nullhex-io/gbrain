@@ -3,7 +3,11 @@ import { chmodSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import type { BrainEngine } from '../src/core/engine.ts';
-import { resolveMcpStdioSourceScope } from '../src/mcp/server.ts';
+import {
+  buildPgliteIpcHandlers,
+  resolveMcpStdioSourceScope,
+  shouldArmStartupSweep,
+} from '../src/mcp/server.ts';
 import { withEnv } from './helpers/with-env.ts';
 
 function makeEngine(registeredSources: string[]): BrainEngine {
@@ -92,9 +96,33 @@ describe('stdio MCP source resolution', () => {
 
       expect(scope).toEqual({
         sourceId: '__all__',
-        localFederatedSourceIds: ['default', 'team-alpha', 'private'],
+        localFederatedSourceIds: ['default', 'private', 'team-alpha'],
         tier: 'env',
       });
     });
+  });
+
+  test('GBRAIN_SOURCE=__all__ fails visibly when active-source enumeration fails', async () => {
+    const brokenEngine = {
+      executeRaw: async () => { throw new Error('sources unavailable'); },
+    } as unknown as BrainEngine;
+    await withEnv({ GBRAIN_SOURCE: '__all__' }, async () => {
+      await expect(resolveMcpStdioSourceScope(brokenEngine, '/nonexistent'))
+        .rejects.toThrow('Unable to enumerate active sources');
+    });
+  });
+
+  test('ambient __all__ PGLite IPC exposes only stateless handlers and skips sweep', async () => {
+    const handlers = await buildPgliteIpcHandlers(
+      makeEngine(['default', 'team-alpha']) as BrainEngine,
+      { sourceId: '__all__', localFederatedSourceIds: ['default', 'team-alpha'], tier: 'env' },
+    );
+    expect(handlers.resolve).toBeDefined();
+    expect(handlers.turn_context).toBeDefined();
+    expect(handlers.context_pack).toBeUndefined();
+    expect(handlers.sync_start).toBeUndefined();
+    expect(handlers.sync_status).toBeUndefined();
+    expect(handlers.sync_abort).toBeUndefined();
+    expect(shouldArmStartupSweep('__all__')).toBe(false);
   });
 });

@@ -27,6 +27,7 @@ import type { CapabilityReport } from '../src/core/capability.ts';
 import { __setChatTransportForTests, type ChatResult } from '../src/core/ai/gateway.ts';
 import { runServe, type ServeOptions } from '../src/commands/serve.ts';
 import { LINK_EXTRACTOR_VERSION_TS } from '../src/core/link-extraction.ts';
+import { withEnv } from './helpers/with-env.ts';
 
 const KEYLESS: CapabilityReport = {
   embeddings: { available: false },
@@ -1740,34 +1741,52 @@ describe('runSweep CLI arg parsing [CX2-5]', () => {
     expect(touches).toEqual([]);
   });
 
+  test('rejects explicit __all__ before a maintenance mutation can touch the engine', async () => {
+    const touches: string[] = [];
+    const r = await runSweepCli(recordingEngine(touches), ['--once', '--source', '__all__']);
+    expect(r.verdict).toBe(2);
+    expect(r.stderr.join('\n')).toContain('source_binding_required');
+    expect(touches).toEqual([]);
+  });
+
+  test('rejects ambient __all__ before a maintenance mutation can touch the engine', async () => {
+    await withEnv({ GBRAIN_SOURCE: '__all__' }, async () => {
+      const touches: string[] = [];
+      const r = await runSweepCli(recordingEngine(touches), ['--once']);
+      expect(r.verdict).toBe(2);
+      expect(r.stderr.join('\n')).toContain('source_binding_required');
+      expect(touches).toEqual([]);
+    });
+  });
+
   test('--budget-ms rejects a non-integer → verdict 2 naming the flag', async () => {
-    const r = await runSweepCli(recordingEngine([]), ['--once', '--budget-ms', 'abc']);
+    const r = await runSweepCli(recordingEngine([]), ['--once', '--source', 'default', '--budget-ms', 'abc']);
     expect(r.verdict).toBe(2);
     expect(r.stderr.join('\n')).toContain('--budget-ms requires a non-negative integer');
     expect(r.stderr.join('\n')).toContain('"abc"');
   });
 
   test('--budget-ms rejects a negative value → verdict 2', async () => {
-    const r = await runSweepCli(recordingEngine([]), ['--once', '--budget-ms', '-5']);
+    const r = await runSweepCli(recordingEngine([]), ['--once', '--source', 'default', '--budget-ms', '-5']);
     expect(r.verdict).toBe(2);
     expect(r.stderr.join('\n')).toContain('--budget-ms');
   });
 
   test('--budget-ms with a MISSING value → verdict 2 (not a crash)', async () => {
-    const r = await runSweepCli(recordingEngine([]), ['--once', '--budget-ms']);
+    const r = await runSweepCli(recordingEngine([]), ['--once', '--source', 'default', '--budget-ms']);
     expect(r.verdict).toBe(2);
     expect(r.stderr.join('\n')).toContain('(missing)');
   });
 
   test('--batch-limit shares the integer validation → verdict 2', async () => {
-    const r = await runSweepCli(recordingEngine([]), ['--once', '--batch-limit', '1.5']);
+    const r = await runSweepCli(recordingEngine([]), ['--once', '--source', 'default', '--batch-limit', '1.5']);
     expect(r.verdict).toBe(2);
     expect(r.stderr.join('\n')).toContain('--batch-limit');
   });
 
   test('--budget-ms 0 --json → machine-readable report on stdout, verdict 0, zero engine touches', async () => {
     const touches: string[] = [];
-    const r = await runSweepCli(recordingEngine(touches), ['--once', '--budget-ms', '0', '--json']);
+    const r = await runSweepCli(recordingEngine(touches), ['--once', '--source', 'default', '--budget-ms', '0', '--json']);
     expect(r.verdict).toBe(0); // budget-skip is partial, NOT total failure
     expect(r.stdout.length).toBe(1); // exactly the JSON blob
     const report = JSON.parse(r.stdout[0]) as SweepReport;

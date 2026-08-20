@@ -116,6 +116,17 @@ describe('recall federated grants (D1b)', () => {
     expect(facts.some((f: string) => f.includes('QQF2'))).toBe(true);
   });
 
+  it('trusted local __all__ recalls active sources without using literal sentinel', async () => {
+    const res: any = await recall().handler(
+      ctx({ remote: false, sourceId: '__all__' }),
+      {},
+    );
+    const facts = (res.facts ?? []).map((f: any) => String(f.fact));
+    expect(facts.some((f: string) => f.includes('QQF1'))).toBe(true);
+    expect(facts.some((f: string) => f.includes('QQF3'))).toBe(true);
+    expect(facts.some((f: string) => f.includes('QQF2'))).toBe(true);
+  });
+
   it('a private superseded fact is invisible to a remote supersessions=true call', async () => {
     const remember = operationsByName['remember'];
     await remember.handler(
