@@ -350,4 +350,59 @@ describe('put_page auto-link cross-source reconciliation', () => {
     expect(removed.auto_links?.removed).toBe(1);
     expect(await engine.getBacklinks(companySlug, { sourceId: WRITER_SOURCE })).toEqual([]);
   });
+
+  test('keeps a desired legacy NULL-provenance edge without adding a markdown duplicate', async () => {
+    const writerSlug = 'notes/source-desired-legacy-null-provenance';
+    const targetSlug = 'concepts/desired-legacy-null-provenance-target';
+    await engine.putPage(writerSlug, {
+      type: 'note', title: 'Desired legacy provenance writer', compiled_truth: '', timeline: '',
+    }, { sourceId: WRITER_SOURCE });
+    await engine.putPage(targetSlug, {
+      type: 'concept', title: 'Desired legacy provenance target', compiled_truth: '', timeline: '',
+    });
+
+    // Seed a pre-v0.13 managed edge whose NULL provenance normalizes to
+    // markdown for reconciliation identity, while remaining a distinct row
+    // to the database unique constraint.
+    await engine.executeRaw(
+      `INSERT INTO links (from_page_id, to_page_id, link_type, context, link_source)
+       SELECT f.id, t.id, $1, '', NULL
+       FROM pages f
+       JOIN pages t ON t.slug = $3 AND t.source_id = 'default'
+       WHERE f.slug = $2 AND f.source_id = $4`,
+      ['mentions', writerSlug, targetSlug, WRITER_SOURCE],
+    );
+
+    const response = await putPage.handler({ engine, remote: false, sourceId: WRITER_SOURCE } as never, {
+      slug: writerSlug,
+      content: `---\ntitle: Desired legacy provenance writer\ntype: note\n---\n\nSee [Legacy target](${targetSlug}).\n`,
+    }) as { auto_links?: { created: number } };
+
+    expect(response.auto_links?.created).toBe(0);
+    const rows = await engine.executeRaw<{ link_source: string | null }>(
+      `SELECT l.link_source
+       FROM links l
+       JOIN pages f ON f.id = l.from_page_id
+       JOIN pages t ON t.id = l.to_page_id
+       WHERE f.slug = $1 AND f.source_id = $2 AND t.slug = $3 AND t.source_id = 'default'`,
+      [writerSlug, WRITER_SOURCE, targetSlug],
+    );
+    expect(rows).toEqual([{ link_source: null }]);
+  });
+
+  test('writes auto-timeline entries into the non-default writer source', async () => {
+    const slug = 'people/source-timeline';
+    await engine.setConfig('auto_timeline', 'true');
+
+    const response = await putPage.handler({ engine, remote: false, sourceId: WRITER_SOURCE } as never, {
+      slug,
+      content: `---\ntitle: Source timeline\ntype: person\n---\n\n## Timeline\n\n- **2026-08-20** | Source-scoped event\n`,
+    }) as { auto_timeline?: { created: number } };
+
+    expect(response.auto_timeline?.created).toBe(1);
+    expect(await engine.getTimeline(slug, { sourceId: WRITER_SOURCE })).toEqual([
+      expect.objectContaining({ summary: 'Source-scoped event' }),
+    ]);
+    expect(await engine.getTimeline(slug, { sourceId: 'default' })).toEqual([]);
+  });
 });

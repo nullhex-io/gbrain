@@ -428,6 +428,7 @@ const put_page: Operation = {
               date: e.date,
               summary: e.summary,
               detail: e.detail || '',
+              source_id: ctx.sourceId ?? 'default',
             }));
             // v0.41.18.0: engine self-retries on Supavisor circuit-breaker
             // recovery. auditSite label routes the audit JSONL emission so
@@ -734,12 +735,17 @@ async function runAutoLink(
     const incKeys = new Set(inc.map(c =>
       `${c.fromSourceId}\u0000${c.fromSlug}\u0000${c.linkType}`
     ));
+    const existingOutKeys = new Set(reconcilableOut.map(l =>
+      `${l.to_source_id}\u0000${l.to_slug}\u0000${l.link_type}\u0000${l.link_source ?? 'markdown'}\u0000${l.origin_source_id ?? ''}\u0000${l.origin_slug ?? ''}`
+    ));
 
     let created = 0, removed = 0, errors = 0;
 
     // Add outgoing edges.
     for (const c of out) {
       try {
+        const existKey = `${c.toSourceId}\u0000${c.targetSlug}\u0000${c.linkType}\u0000${c.linkSource ?? 'markdown'}\u0000${c.originSlug ? pageSourceId : ''}\u0000${c.originSlug ?? ''}`;
+        if (existingOutKeys.has(existKey)) continue;
         await tx.addLink(
           c.fromSlug ?? slug, c.targetSlug, c.context, c.linkType,
           c.linkSource, c.originSlug, c.originField,
@@ -749,11 +755,8 @@ async function runAutoLink(
             originSourceId: pageSourceId,
           },
         );
-        const existKey = `${c.toSourceId}\u0000${c.targetSlug}\u0000${c.linkType}\u0000${c.linkSource ?? 'markdown'}`;
-        const exists = reconcilableOut.some(l =>
-          `${l.to_source_id}\u0000${l.to_slug}\u0000${l.link_type}\u0000${l.link_source ?? 'markdown'}` === existKey
-        );
-        if (!exists) created++;
+        existingOutKeys.add(existKey);
+        created++;
       } catch {
         errors++;
       }
